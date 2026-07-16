@@ -125,7 +125,7 @@ FIM_NOISE_PATHS = [
 VALID_HANDLER_CATEGORIES = {
     "auth", "privilege", "user_mgmt", "fim", "malware",
     "evasion", "network", "web", "hardware", "registry", "generic",
-    "agent_status",
+    "agent_dis_connect.py",
 }
 
 RULE_CATEGORY_MAP = {
@@ -214,15 +214,15 @@ RULE_CATEGORY_MAP = {
     # and 100501 (level 3) — only 100032 (level 7) happened to pass.
     # The entire "agent registered/disconnected" alerting story was
     # non-functional. Now routed to a dedicated handler; see
-    # handlers/agent_status.py for which of these actually alert vs.
+    # handlers/agent_dis_connect.py.py for which of these actually alert vs.
     # are intentionally suppressed (100033, 100500 — routine
     # reconnect/connect, covered separately by agent_monitor.py).
-    "100030": "agent_status",
-    "100031": "agent_status",
-    "100032": "agent_status",
-    "100033": "agent_status",
-    "100500": "agent_status",
-    "100501": "agent_status",
+  "100030": "agent_dis_connect",
+  "100031": "agent_dis_connect",
+  "100032": "agent_dis_connect",
+  "100033": "agent_dis_connect",
+  "100500": "agent_dis_connect",
+  "100501": "agent_dis_connect",
 }
 
 # Fail loudly at import time if the map ever drifts from the whitelist,
