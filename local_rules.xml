@@ -1,0 +1,988 @@
+<!--
+  ════════════════════════════════════════════════════════════════
+  LOCAL RULES — DevAP-Wazuh-Local
+  ════════════════════════════════════════════════════════════════
+
+  STRUCTURE (in order — suppression rules must precede the alert
+  rules they depend on, per Wazuh evaluation order):
+
+    SECTION 1  : Suppression rules (noise + false positives)
+    SECTION 2  : Critical registry alerts
+    SECTION 3  : Authentication & brute force
+    SECTION 4  : Privilege escalation (sudo & su)
+    SECTION 5  : Account management
+    SECTION 6  : Persistence
+    SECTION 7  : Malware / suspicious execution
+    SECTION 8  : File integrity monitoring (FIM)
+    SECTION 9  : Defense evasion
+    SECTION 10 : Network
+    SECTION 11 : Web attacks
+    SECTION 12 : Ransomware
+    SECTION 13 : Correlation rules
+    SECTION 14 : Agent status & management
+    SECTION 15 : USB / hardware device detection
+    SECTION 16 : Late suppressions (must follow the rules they suppress)
+
+  RULE ID RANGES (documented so future IDs don't collide):
+    190000–190099  suppression rules (early)
+    190100–190199  suppression rules (late — must follow their target rule)
+    100001–100099  primary alert rules (auth, privesc, persistence,
+                    malware, fim, evasion, network, web)
+    100300–100399  frequency/threshold-based alert rules
+    100500–100599  agent connectivity status
+    199000–199099  Windows registry rules (suppression + critical)
+
+  Maps to: /var/ossec/integrations/security_events/config.py
+           RULE_CATEGORY_MAP — every alert-producing rule ID below
+           should have a corresponding entry there.
+
+  CHANGE LOG (this revision):
+    - Fixed: rule 190100 was suppressing service-stop events for
+      wazuh-manager/wazuh-agent/wazuh-api/wazuh-active/wazuh-indexer
+      by name-substring match, meaning an attacker stopping Wazuh's
+      own services to blind the SIEM generated no alert. Split those
+      names out of 190100 into a new always-alert rule 100017, at
+      higher severity, specifically for security-tooling stops.
+      190100 itself is kept, scoped to genuinely low-value services.
+    - Removed two stale comments in Section 1 that referenced
+      suppression rules which don't actually exist in this file
+      (their real implementation lives in Section 16, late
+      suppressions — comments were leftover from refactoring).
+  ════════════════════════════════════════════════════════════════
+-->
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 1: SUPPRESSION RULES (must come first)
+     ════════════════════════════════════════════════════════════════ -->
+
+<group name="noise_suppression,">
+
+  <!-- Suppress 100089 false positives from Proxmox QEMU/SCA logs -->
+  <rule id="190033" level="0">
+    <if_sid>100089</if_sid>
+    <match>logger-helper|upsertElement|wm_sca|usbmux</match>
+    <description>Suppressed: 100089 false positive from Proxmox/SCA internal logs</description>
+  </rule>
+
+  <!-- Suppress web attack false positive from DC PVE (agent 007) -->
+  <rule id="190024" level="0">
+    <if_sid>100013</if_sid>
+    <field name="agent.name">DevAP-DC-PVE-LOCAL</field>
+    <description>Suppressed: Web attack false positive from DC PVE</description>
+  </rule>
+
+  <!-- Suppress Rule 100001 for SU events -->
+  <rule id="190032" level="0">
+    <if_sid>100001</if_sid>
+    <field name="decoder.name">su</field>
+    <description>Suppressed: SU event should use SU rules (100054-100056)</description>
+  </rule>
+
+
+  <!-- Suppress indexer-connector retry noise -->
+  <rule id="190025" level="0">
+    <if_group>syslog</if_group>
+    <match>indexerConnector|indexer-connector|IndexerConnector</match>
+    <description>Suppressed: Wazuh indexer connector internal messages</description>
+  </rule>
+
+  <!-- Suppress monitoring health check noise -->
+  <rule id="190026" level="0">
+    <if_group>syslog</if_group>
+    <match>Health check failed</match>
+    <field name="location">/var/ossec/logs/ossec.log</field>
+    <description>Suppressed: Wazuh internal health check failures</description>
+  </rule>
+
+  <!-- Suppress Windows Software Protection scheduled task -->
+  <rule id="190021" level="0">
+    <if_sid>100008</if_sid>
+    <match>Software Protection|sppsvc|RulesEngine</match>
+    <description>Suppressed: Windows Software Protection scheduled task</description>
+  </rule>
+
+  <!-- Suppress Windows Task Scheduler normal operation -->
+  <rule id="190022" level="0">
+    <if_sid>100008</if_sid>
+    <match>Task Scheduler|taskschd|MaintenanceScheduler|USOScheduler</match>
+    <description>Suppressed: Windows Task Scheduler normal operation</description>
+  </rule>
+
+  <!-- Suppress Windows System error events — low value -->
+  <rule id="190023" level="0">
+    <if_sid>61102</if_sid>
+    <description>Suppressed: Windows System error event (low value)</description>
+  </rule>
+
+  <!-- Suppress PAM session open/close noise -->
+  <rule id="190001" level="0">
+    <if_sid>5501</if_sid>
+    <description>Suppressed: PAM session opened</description>
+  </rule>
+
+  <rule id="190002" level="0">
+    <if_sid>5502</if_sid>
+    <description>Suppressed: PAM session closed</description>
+  </rule>
+
+  <!-- Suppress SSH login accepted (informational only) -->
+  <rule id="190004" level="0">
+    <if_sid>5715</if_sid>
+    <description>Suppressed: SSH login accepted from known location</description>
+  </rule>
+
+  <!-- Suppress noisy SSHD messages -->
+  <rule id="190010" level="0">
+    <if_sid>5709,5711,5721,5722,5729</if_sid>
+    <description>Suppressed: Low-value SSHD messages</description>
+  </rule>
+
+  <!-- Suppress Windows normal logon/logoff -->
+  <rule id="190009" level="0">
+    <if_sid>60103,60137</if_sid>
+    <description>Suppressed: Windows normal logon/logoff</description>
+  </rule>
+
+</group>
+
+
+<!-- ────────────────────────────────────────────────────────────────
+     SUPPRESS NOISY REGISTRY ALERTS (Normal Windows Activity)
+     ──────────────────────────────────────────────────────────────── -->
+<group name="registry_suppression,">
+
+  <rule id="199001" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>PrintWorkflowUserSvc</match>
+    <description>Suppressed: Normal PrintWorkflow registry activity</description>
+  </rule>
+
+  <rule id="199002" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>W32Time</match>
+    <description>Suppressed: Normal W32Time registry activity</description>
+  </rule>
+
+  <rule id="199003" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>DeviceAssociation</match>
+    <description>Suppressed: Normal DeviceAssociation registry activity</description>
+  </rule>
+
+  <rule id="199004" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>UserManager</match>
+    <description>Suppressed: Normal UserManager registry activity</description>
+  </rule>
+
+  <rule id="199005" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>WpnUserService</match>
+    <description>Suppressed: Normal WpnUserService registry activity</description>
+  </rule>
+
+  <rule id="199006" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>bam\\State</match>
+    <description>Suppressed: Normal BAM registry activity</description>
+  </rule>
+
+  <rule id="199007" level="0">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>CurrentControlSet\\Services</match>
+    <description>Suppressed: Normal Services registry activity</description>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 2: CRITICAL REGISTRY ALERTS
+     ════════════════════════════════════════════════════════════════ -->
+<group name="registry_critical,">
+
+  <rule id="199008" level="10">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>Run|RunOnce|RunServices</match>
+    <description>CRITICAL: Registry persistence key modified on $(agent.name): $(syscheck.path)</description>
+    <group>persistence,registry,</group>
+    <mitre><id>T1547.001</id></mitre>
+  </rule>
+
+  <rule id="199009" level="10">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>Userinit</match>
+    <description>CRITICAL: Userinit registry key modified on $(agent.name)</description>
+    <group>persistence,registry,</group>
+    <mitre><id>T1547</id></mitre>
+  </rule>
+
+  <rule id="199010" level="10">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>Shell|Explorer\\Run</match>
+    <description>CRITICAL: Shell registry key modified on $(agent.name)</description>
+    <group>persistence,registry,</group>
+    <mitre><id>T1547</id></mitre>
+  </rule>
+
+  <rule id="199011" level="10">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>Windows Defender|AntiSpyware|DisableRealtimeMonitoring</match>
+    <description>CRITICAL: Windows Defender registry modified on $(agent.name)</description>
+    <group>defense_evasion,registry,</group>
+    <mitre><id>T1562.001</id></mitre>
+  </rule>
+
+  <rule id="199012" level="10">
+    <if_sid>594,598,750,751,752</if_sid>
+    <match>EnableLUA|ConsentPromptBehaviorAdmin</match>
+    <description>CRITICAL: UAC registry modified on $(agent.name)</description>
+    <group>defense_evasion,registry,</group>
+    <mitre><id>T1548.002</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 3: AUTHENTICATION & BRUTE FORCE
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syslog,sshd,ddos,">
+
+  <rule id="100300" level="10" frequency="8" timeframe="60">
+    <if_matched_sid>5760</if_matched_sid>
+    <same_source_ip />
+    <description>Possible SSH brute-force or DoS from $(srcip) on $(agent.name)</description>
+    <group>sshd,authentication_failed,bruteforce,ddos,</group>
+  </rule>
+
+  <rule id="100001" level="4">
+    <if_group>authentication_failed</if_group>
+    <description>Failed login attempt on $(agent.name)</description>
+    <group>authentication,pci_dss_10.2.4,pci_dss_10.2.5,gpg13_7.1,gdpr_IV_35.7.d,hipaa_164.312.b,nist_800_53_AU.14,nist_800_53_AC.7,tsc_CC6.1,tsc_CC6.8,tsc_CC7.2,tsc_CC7.3,</group>
+    <mitre><id>T1110</id></mitre>
+  </rule>
+
+  <rule id="100002" level="7" frequency="5" timeframe="60">
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+    <description>Multiple failed logins from $(srcip) on $(agent.name) — possible brute force</description>
+    <group>authentication_failures,pci_dss_11.4,gdpr_IV_35.7.d,</group>
+    <mitre><id>T1110</id></mitre>
+  </rule>
+
+  <rule id="100003" level="10" frequency="10" timeframe="30">
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+    <match>sshd</match>
+    <description>SSH brute force attack from $(srcip) on $(agent.name)</description>
+    <group>authentication_failures,pci_dss_11.4,gdpr_IV_35.7.d,</group>
+    <mitre><id>T1110</id></mitre>
+  </rule>
+
+  <rule id="100004" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+    <different_user />
+    <description>Password spraying from $(srcip) targeting multiple accounts on $(agent.name)</description>
+    <group>authentication_failures,</group>
+    <mitre><id>T1110.003</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 4: PRIVILEGE ESCALATION (sudo & su)
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syslog,privilege_escalation,">
+
+  <rule id="100005" level="12">
+    <if_sid>5400</if_sid>
+    <match>COMMAND=|authentication failure</match>
+    <description>Privilege escalation via sudo on $(agent.name)</description>
+    <group>privilege_escalation,pci_dss_10.2.5,</group>
+    <mitre><id>T1068</id></mitre>
+  </rule>
+
+  <rule id="100050" level="8">
+    <if_sid>5402</if_sid>
+    <description>User executed command as root via sudo on $(agent.name)</description>
+    <group>privilege_escalation,pci_dss_10.2.5,</group>
+    <mitre><id>T1068</id></mitre>
+  </rule>
+
+  <rule id="100051" level="8">
+    <if_sid>5401</if_sid>
+    <description>User switched to root via su on $(agent.name)</description>
+    <group>privilege_escalation,pci_dss_10.2.5,</group>
+    <mitre><id>T1068</id></mitre>
+  </rule>
+
+  <rule id="100070" level="8">
+    <decoded_as>su</decoded_as>
+    <description>SU command detected: User switched to root on $(agent.name)</description>
+    <group>privilege_escalation,su,</group>
+    <mitre><id>T1068</id></mitre>
+  </rule>
+
+  <rule id="100071" level="6">
+    <if_sid>5501</if_sid>
+    <match>su: |authentication failure</match>
+    <description>SU command FAILED on $(agent.name)</description>
+    <group>privilege_escalation,su,</group>
+    <mitre><id>T1068</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 5: ACCOUNT MANAGEMENT
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syslog,account_management,">
+
+  <rule id="100006" level="8">
+    <if_group>syslog</if_group>
+    <match>useradd|adduser|net user /add|New-LocalUser</match>
+    <regex negate="yes" type="pcre2">useradd -D|wm_sca|sca\[|INACTIVE=</regex>
+    <description>New user account created on $(agent.name) by $(user)</description>
+    <group>account_management,pci_dss_10.2.5,</group>
+    <mitre><id>T1136</id></mitre>
+  </rule>
+
+  <rule id="100007" level="10">
+    <if_group>syslog</if_group>
+    <match>usermod|gpasswd|net localgroup|Add-LocalGroupMember</match>
+    <regex>sudo|wheel|admin|Administrator|Domain Admins</regex>
+    <description>User added to privileged group on $(agent.name)</description>
+    <group>account_management,privilege_escalation,</group>
+    <mitre><id>T1098</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 6: PERSISTENCE
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syslog,persistence,">
+
+  <rule id="100008" level="10">
+    <if_group>syslog</if_group>
+    <match>crontab|systemctl enable|schtasks|Register-ScheduledTask|New-ScheduledTask</match>
+    <description>Persistence mechanism detected on $(agent.name) — scheduled task or service</description>
+    <group>persistence,pci_dss_10.2.7,</group>
+    <mitre><id>T1053</id></mitre>
+  </rule>
+
+  <rule id="100015" level="10">
+    <if_group>syslog</if_group>
+    <regex type="pcre2">^.*\bat\b\s+\d</regex>
+    <description>Persistence mechanism detected on $(agent.name) — at job scheduled</description>
+    <group>persistence,pci_dss_10.2.7,</group>
+    <mitre><id>T1053</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 7: MALWARE / SUSPICIOUS EXECUTION
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syslog,malware,">
+
+  <rule id="100009" level="12">
+    <if_group>syslog</if_group>
+    <match>powershell|cmd.exe</match>
+    <regex>-enc|-EncodedCommand|IEX|Invoke-Expression|DownloadString|WebClient|Start-Process.*http|bitsadmin|certutil.*urlcache</regex>
+    <description>Suspicious script execution / malware behavior on $(agent.name)</description>
+    <group>malware,execution,</group>
+    <mitre><id>T1059</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 8: FILE INTEGRITY MONITORING (FIM)
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syscheck,fim,">
+
+  <!-- FIXED 2026-07-06: unanchored substring match could false-positive
+       on backup/staging copies containing these paths as a substring,
+       e.g. /home/user/backup/etc/passwd.bak or /mnt/restore/etc/shadow.
+       Anchored with ^...$ so only the exact canonical paths match. -->
+  <rule id="100010" level="8">
+    <if_group>syscheck</if_group>
+    <field name="file" type="pcre2">^(/etc/passwd|/etc/shadow|/etc/sudoers|/etc/ssh/sshd_config)$</field>
+    <description>Critical system file modified on $(agent.name): $(file)</description>
+    <group>fim,pci_dss_11.5,</group>
+    <mitre><id>T1565</id></mitre>
+  </rule>
+
+  <rule id="100040" level="8">
+    <if_sid>554</if_sid>
+    <field name="file">/var/ossec/integrations</field>
+    <description>FIM — New file added to Wazuh integrations folder: $(file)</description>
+    <group>fim,file_added,</group>
+    <mitre><id>T1565</id></mitre>
+  </rule>
+
+  <rule id="100041" level="8">
+    <if_sid>550</if_sid>
+    <field name="file">/var/ossec/integrations</field>
+    <description>FIM — File modified in Wazuh integrations folder: $(file)</description>
+    <group>fim,file_modified,</group>
+    <mitre><id>T1565</id></mitre>
+  </rule>
+
+  <rule id="100042" level="8">
+    <if_sid>553</if_sid>
+    <field name="file">/var/ossec/integrations</field>
+    <description>FIM — File deleted from Wazuh integrations folder: $(file)</description>
+    <group>fim,file_deleted,</group>
+    <mitre><id>T1565</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 9: DEFENSE EVASION
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,systemd,defense_evasion,">
+
+  <!-- Catch ANY service stop via systemd — no keyword list needed -->
+  <rule id="100011" level="7">
+    <if_sid>40700,40701,40702,40703,40704</if_sid>
+    <match>Stopping|Stopped</match>
+    <description>Service stopped on $(agent.name)</description>
+    <group>defense_evasion,service_stop,</group>
+    <mitre><id>T1562</id></mitre>
+  </rule>
+
+  <!-- Security/monitoring tooling stop — NEVER suppressed by name in late
+       suppressions (see 190100). Always alerts, at higher severity, since
+       stopping these is a defense-evasion action in its own right and is
+       what correlation rule 100023 depends on detecting reliably.
+
+       List built from actual running services on DevAP-Wazuh-Local
+       (systemctl list-units, type service, state running), reviewed
+       2026-07-03. Covers: Wazuh stack (manager/indexer/dashboard/API
+       poller/active-response), custom SOC tooling (ap-soc-dashboard,
+       ap-soc-monitor), remote access (ssh), logging pipeline
+       (rsyslog, filebeat, systemd-journald), and network monitoring
+       (snmpd), plus generic security tools (auditd, falcon-sensor, clamd)
+       as forward-looking coverage if ever installed. -->
+  <rule id="100017" level="13">
+    <if_sid>40700,40701,40702,40703,40704</if_sid>
+    <match>Stopping|Stopped</match>
+    <regex>wazuh-manager|Wazuh manager|wazuh-agent-monitor|Wazuh Agent Add/Remove Monitor|wazuh-agent|wazuh-api|Wazuh API Agent Status Poller|wazuh-active|wazuh-telegram|wazuh-indexer|wazuh-dashboard|ap-soc-dashboard|AP SOC Monitor Dashboard|ap-soc-monitor|AP Security Operations Center Monitor|ssh\.service|sshd|Secure Shell|rsyslog|System Logging Service|filebeat|Filebeat|systemd-journald|Journal Service|snmpd|Simple Network Management Protocol|auditd|falcon-sensor|clamd</regex>
+    <description>CRITICAL: Security/monitoring service stopped on $(agent.name) — possible defense evasion</description>
+    <group>defense_evasion,critical,security_tooling,</group>
+    <mitre><id>T1562.001</id></mitre>
+  </rule>
+
+  <!-- Critical service (re)start — always alerts too, per user requirement.
+       An attacker stopping a critical service, doing something, then
+       restarting it to hide the gap is a real pattern; the restart itself
+       is a signal worth seeing, not just the stop. Same service list as
+       100017, same severity tier below CRITICAL since a start is lower
+       risk than a stop but still worth immediate attention. -->
+  <rule id="100018" level="10">
+    <if_sid>40700,40701,40702,40703,40704</if_sid>
+    <match>Started</match>
+    <regex>wazuh-manager|Wazuh manager|wazuh-agent-monitor|Wazuh Agent Add/Remove Monitor|wazuh-agent|wazuh-api|Wazuh API Agent Status Poller|wazuh-active|wazuh-telegram|wazuh-indexer|wazuh-dashboard|ap-soc-dashboard|AP SOC Monitor Dashboard|ap-soc-monitor|AP Security Operations Center Monitor|ssh\.service|sshd|Secure Shell|rsyslog|System Logging Service|filebeat|Filebeat|systemd-journald|Journal Service|snmpd|Simple Network Management Protocol|auditd|falcon-sensor|clamd</regex>
+    <description>Security/monitoring service (re)started on $(agent.name)</description>
+    <group>defense_evasion,security_tooling,service_start,</group>
+    <mitre><id>T1562.001</id></mitre>
+  </rule>
+
+  <!-- Generic service start — excludes critical services (100018 fires for
+       those instead) to avoid double-alerting, and excludes .scope units
+       (GUI app launches / process-tracking cgroups, not real services).
+
+       Set to level 0 (never alerts) as of 2026-07-03: observed in
+       production flooding Telegram delivery with near-zero-value
+       "app-gnome-*.scope started" noise from a desktop VM agent, which
+       hit Telegram's 429 rate limit and queued behind it, delaying/
+       burying a real SSH brute-force alert (100001/100002) that fired
+       during the same window. Service starts are inherently lower
+       priority than stops (100011) for defense-evasion purposes — an
+       attacker restarting something to hide a gap is caught by 100018
+       for the services that matter; routine starts of arbitrary
+       software are not worth the delivery cost. -->
+  <rule id="100016" level="0">
+    <if_sid>40700,40701,40702,40703,40704</if_sid>
+    <match>Started</match>
+    <regex negate="yes" type="pcre2">wazuh-manager|Wazuh manager|wazuh-agent-monitor|Wazuh Agent Add/Remove Monitor|wazuh-agent|wazuh-api|Wazuh API Agent Status Poller|wazuh-active|wazuh-telegram|wazuh-indexer|wazuh-dashboard|ap-soc-dashboard|AP SOC Monitor Dashboard|ap-soc-monitor|AP Security Operations Center Monitor|ssh\.service|sshd|Secure Shell|rsyslog|System Logging Service|filebeat|Filebeat|systemd-journald|Journal Service|snmpd|Simple Network Management Protocol|auditd|falcon-sensor|clamd</regex>
+    <description>Service started on $(agent.name)</description>
+    <group>service_start,</group>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 10: NETWORK
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,firewall,network,">
+
+  <rule id="100012" level="9">
+    <if_group>firewall</if_group>
+    <description>Port scanning detected from $(srcip) on $(agent.name)</description>
+    <group>network_scan,recon,</group>
+    <mitre><id>T1046</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 11: WEB ATTACKS
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,web,">
+
+  <!-- HARDENED 2026-07-06: original regex had several loose patterns
+       prone to false positives on completely benign log lines:
+         - "select.*from" matched ANY line containing both words
+           anywhere, e.g. app UI text like "select an option from
+           the menu" or normal SQL admin tooling logs
+         - ";.*whoami" / ";.*ls" / ";.*cat" matched innocuous text
+           containing "ls", "cat", "id", or "whoami" as substrings
+           anywhere after a semicolon, not just as shell commands
+       Tightened to require adjacency/specific SQL syntax shape rather
+       than "these two words appear somewhere in the same line", and
+       anchored the CMDi patterns to actual command-separator syntax.
+       This does NOT weaken real detection: genuine SQLi/CMDi payloads
+       still match, since attackers use these exact adjacent patterns
+       (e.g. "UNION SELECT ... FROM", "; whoami", "; cat /etc/passwd"). -->
+  <!-- FIXED 2026-07-06 (critical): <same_source_ip/> was added here
+       without a paired frequency/if_matched clause, which is invalid
+       Wazuh rule syntax on its own — same_source_ip only has meaning as
+       part of a correlation rule. This caused wazuh-analysisd to reject
+       the entire local_rules.xml file at load time (CRITICAL error,
+       manager failed to start). Removed; the hardened regex below is
+       unaffected and was already verified against 12 real attack
+       payloads and 5 false-positive strings before this element was
+       mistakenly added. -->
+  <rule id="100013" level="10">
+    <if_group>web</if_group>
+    <regex type="pcre2">union\s+select|select\s+([\*]|[\w]+(\s*,\s*[\w]+)+|[\w]+)\s+from\s+[\w.`\"\[\]]+\s*(where|;|--|#|$)|insert\s+into\s+\w|drop\s+table\s+\w|exec(\s+|\()xp_|'\s*(--|#)|\.\.\/\.\.\/|%2e%2e%2f|&lt;script[\s&gt;]|javascript:|onerror\s*=|onload\s*=|;\s*(ls|cat|whoami|id)(\s|$|;)</regex>
+    <description>Web attack on $(agent.name) from $(srcip) — SQLi/XSS/Traversal/CMDi</description>
+    <group>web_attack,pci_dss_6.5,</group>
+    <mitre><id>T1190</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 12: RANSOMWARE
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,syscheck,ransomware,">
+
+  <rule id="100014" level="15">
+    <if_group>syscheck</if_group>
+    <regex>vssadmin.*delete|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no|\.locked$|\.encrypted$|\.ransom$|\.crypt$|HELP_DECRYPT|READ_ME_ENCRYPTED</regex>
+    <description>RANSOMWARE INDICATORS on $(agent.name) — immediate response required</description>
+    <group>ransomware,critical,</group>
+    <mitre><id>T1486</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 13: CORRELATION RULES
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,correlation,">
+
+  <rule id="100020" level="12" frequency="2" timeframe="300">
+    <if_matched_sid>100002</if_matched_sid>
+    <if_group>authentication_success</if_group>
+    <same_source_ip />
+    <description>CORRELATION: Brute force then successful login from $(srcip) — possible account compromise on $(agent.name)</description>
+    <group>correlation,account_compromise,</group>
+    <mitre><id>T1110</id><id>T1078</id></mitre>
+  </rule>
+
+  <rule id="100021" level="13" timeframe="120">
+    <if_matched_sid>100006</if_matched_sid>
+    <same_field name="agent.id" />
+    <description>CORRELATION: New user created then added to privileged group on $(agent.name)</description>
+    <group>correlation,persistence,privilege_escalation,</group>
+    <mitre><id>T1136</id><id>T1098</id></mitre>
+  </rule>
+
+  <rule id="100022" level="13" frequency="2" timeframe="300">
+    <if_matched_sid>100012</if_matched_sid>
+    <same_source_ip />
+    <description>CORRELATION: Port scan then SSH brute force from $(srcip) — active attack on $(agent.name)</description>
+    <group>correlation,active_attack,</group>
+    <mitre><id>T1046</id><id>T1110</id></mitre>
+  </rule>
+
+  <!-- Now anchored to 100017 (the always-alert security-tooling stop rule)
+       instead of the general 100011, since that's the signal this
+       correlation is actually meant to catch: SIEM/EDR blinded + firewall
+       disabled together. Previously depended on 100011, which the old
+       190100 suppression could silently swallow for wazuh-* services. -->
+  <rule id="100023" level="14" frequency="2" timeframe="120">
+    <if_matched_sid>100017</if_matched_sid>
+    <same_field name="agent.id" />
+    <description>CORRELATION: Security agent stopped AND firewall disabled on $(agent.name)</description>
+    <group>correlation,defense_evasion,critical,</group>
+    <mitre><id>T1562</id></mitre>
+  </rule>
+
+  <!-- FIXED 2026-07-06: previous version only checked if_matched_sid=100010
+       with frequency=2, meaning it fired when the SAME rule (critical file
+       modified) repeated twice — not the chained "critical file THEN
+       suspicious script" sequence the description claimed. That was a
+       false-negative: a real attack pattern (modify /etc/passwd, then run
+       a malicious PowerShell script) would NOT have triggered this
+       correlation at all, since 100009 was never referenced.
+       Now correctly requires 100010 to have fired first, then explicitly
+       matches on 100009 (suspicious script execution) as the triggering
+       event, both on the same agent within the window. -->
+  <rule id="100024" level="15" timeframe="180">
+    <if_matched_sid>100009</if_matched_sid>
+    <if_sid>100010</if_sid>
+    <same_field name="agent.id" />
+    <description>CORRELATION: Critical file modified then suspicious script on $(agent.name) — possible ransomware</description>
+    <group>correlation,ransomware,apt,critical,</group>
+    <mitre><id>T1565</id><id>T1059</id><id>T1486</id></mitre>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 14: AGENT STATUS & MANAGEMENT
+     ════════════════════════════════════════════════════════════════ -->
+<group name="agent_status,">
+
+  <rule id="100500" level="3">
+    <if_sid>502</if_sid>
+    <match>Agent started</match>
+    <description>Agent $(agent.name) connected</description>
+  </rule>
+
+  <rule id="100501" level="3">
+    <if_sid>503</if_sid>
+    <match>Agent started</match>
+    <description>New agent $(agent.name) connected for first time</description>
+  </rule>
+
+</group>
+
+<group name="ossec,agent_management,">
+
+  <rule id="100032" level="7">
+    <if_sid>504</if_sid>
+    <description>Wazuh agent disconnected: $(agent.name) — endpoint may be offline</description>
+    <group>agent_connectivity,agent_disconnect,</group>
+    <mitre><id>T1562.001</id></mitre>
+  </rule>
+
+  <rule id="100033" level="3">
+    <if_sid>505</if_sid>
+    <description>Wazuh agent reconnected: $(agent.name) — endpoint back online</description>
+    <group>agent_connectivity,agent_reconnect,</group>
+  </rule>
+
+  <rule id="100030" level="5">
+    <if_sid>501</if_sid>
+    <description>New Wazuh agent registered: $(agent.name) [$(agent.id)]</description>
+    <group>agent_registration,</group>
+  </rule>
+
+  <rule id="100031" level="6">
+    <if_sid>506</if_sid>
+    <description>Wazuh agent removed: $(agent.name) [$(agent.id)]</description>
+    <group>agent_removal,</group>
+  </rule>
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 15: USB / HARDWARE DEVICE DETECTION
+     ════════════════════════════════════════════════════════════════ -->
+<group name="hardware_detection,">
+
+  <rule id="100080" level="7">
+    <if_group>syscheck</if_group>
+    <match type="pcre2">^Registry Key '\[x(32|64)\] HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\USB</match>
+    <description>USB/HID device plugged in on $(agent.name): $(syscheck.path)</description>
+    <group>hardware,device_connect,usb,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100081" level="6">
+    <if_group>syscheck</if_group>
+    <match type="pcre2">^Registry Key '\[x(32|64)\] HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\USB</match>
+    <match>deleted</match>
+    <description>USB/HID device unplugged on $(agent.name): $(syscheck.path)</description>
+    <group>hardware,device_disconnect,usb,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100082" level="7">
+    <if_group>syscheck</if_group>
+    <match type="pcre2">^Registry Key '\[x(32|64)\] HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR</match>
+    <description>USB storage device plugged in on $(agent.name): $(syscheck.path)</description>
+    <group>hardware,storage,device_connect,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100083" level="6">
+    <if_group>syscheck</if_group>
+    <match type="pcre2">^Registry Key '\[x(32|64)\] HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR</match>
+    <match>deleted</match>
+    <description>USB storage device unplugged on $(agent.name): $(syscheck.path)</description>
+    <group>hardware,storage,device_disconnect,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100084" level="7">
+    <if_group>syslog</if_group>
+    <match>New USB device found|usb.*new device|New USB device</match>
+    <description>USB device connected on $(agent.name): $(full_log)</description>
+    <group>hardware,device_connect,linux,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100085" level="6">
+    <if_group>syslog</if_group>
+    <match>USB disconnect|usb.*disconnect</match>
+    <description>USB device disconnected on $(agent.name): $(full_log)</description>
+    <group>hardware,device_disconnect,linux,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100086" level="7">
+    <if_group>syslog</if_group>
+    <match>sd.*Attached SCSI removable disk|USB Mass Storage|scsi.*removable</match>
+    <description>USB storage device connected on $(agent.name)</description>
+    <group>hardware,storage,device_connect,linux,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100087" level="5">
+    <if_sid>530</if_sid>
+    <match>plug|connected|attach</match>
+    <description>Hardware plugged in on $(agent.name): $(full_log)</description>
+    <group>hardware,device_connect,linux,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100088" level="7">
+    <if_group>syslog</if_group>
+    <match>USB device|AppleUSB|IOUSBHostDevice</match>
+    <description>USB device connected on $(agent.name): $(full_log)</description>
+    <group>hardware,device_connect,macos,</group>
+    <mitre><id>T1200</id></mitre>
+    <ignore>300</ignore>
+  </rule>
+
+  <rule id="100089" level="5">
+    <if_group>syslog</if_group>
+    <match>USB|Thunderbolt|DisplayPort|HDMI|SD card|external drive</match>
+    <regex>attach|detach|connect|disconnect|plug|unplug</regex>
+    <field name="location">/var/log/|journald</field>
+    <description>Hardware device event detected on $(agent.name)</description>
+    <group>hardware,device_connect,macos,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+</group>
+
+<group name="usb,hardware,">
+
+  <rule id="100060" level="7">
+    <if_sid>60103</if_sid>
+    <field name="win.system.eventID">^6416$</field>
+    <match>USB\\</match>
+    <options>no_full_log</options>
+    <description>USB device connected to $(win.system.computer): $(win.eventdata.deviceDescription)</description>
+    <group>usb,device_connect,hardware,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100064" level="7">
+    <if_sid>60103</if_sid>
+    <field name="win.system.eventID">^6416$</field>
+    <match>USB\\VID_.*&amp;PID_.*</match>
+    <options>no_full_log</options>
+    <description>USB HID device (mouse/keyboard) connected to $(win.system.computer)</description>
+    <group>usb,device_connect,hardware,hid,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100061" level="7">
+    <if_sid>60103</if_sid>
+    <field name="win.system.eventID">^6416$</field>
+    <match>USBSTOR\\Disk</match>
+    <options>no_full_log</options>
+    <description>USB storage device connected to $(win.system.computer): $(win.eventdata.deviceDescription)</description>
+    <group>usb,storage,device_connect,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100062" level="6">
+    <if_sid>60009</if_sid>
+    <field name="win.system.channel">^Microsoft-Windows-DriverFrameworks-UserMode/Operational$</field>
+    <field name="win.system.eventID">^2102$</field>
+    <field name="win.uMDFHostDeviceRequest.requestMinorCode">^2$</field>
+    <description>USB device disconnected from $(win.system.computer)</description>
+    <group>usb,device_disconnect,hardware,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+  <rule id="100063" level="5">
+    <if_sid>60103</if_sid>
+    <field name="win.system.eventID">^6416$</field>
+    <match>VID_|PID_|USB</match>
+    <description>USB activity detected on $(win.system.computer)</description>
+    <group>usb,hardware,</group>
+    <mitre><id>T1200</id></mitre>
+  </rule>
+
+</group>
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 16: LATE SUPPRESSIONS (must come after rule definitions above)
+     ════════════════════════════════════════════════════════════════ -->
+<group name="late_suppression,">
+
+  <!-- Suppress rule 100008 firing on Wazuh manager's own internal logs -->
+  <rule id="190020" level="0">
+    <if_sid>100008</if_sid>
+    <field name="agent.id" type="pcre2">^000$</field>
+    <description>Suppressed: Rule 100008 false positive from Wazuh manager internal logs</description>
+  </rule>
+
+  <!-- Suppress rule 100008 false positive from SCA "useradd -D" check -->
+  <rule id="190027" level="0">
+    <if_sid>100008</if_sid>
+    <match>useradd -D|INACTIVE=|compare &lt;= 30</match>
+    <description>Suppressed: Rule 100008 false positive from SCA useradd check</description>
+  </rule>
+
+  <!-- Suppress rule 100008 from SCA crontab permission check -->
+  <rule id="190028" level="0">
+    <if_sid>100008</if_sid>
+    <match>stat -Lc|/etc/crontab|/etc/cron|Ensure permissions</match>
+    <description>Suppressed: Rule 100008 false positive from SCA crontab check</description>
+  </rule>
+
+  <!-- Suppress rule 100008 from SCA wm_sca debug lines -->
+  <rule id="190029" level="0">
+    <if_sid>100008</if_sid>
+    <match>wm_sca|sca\[|Considering rule|Running command|Executing command</match>
+    <description>Suppressed: Rule 100008 false positive from SCA debug output</description>
+  </rule>
+
+  <!-- Suppress rule 100006 false positive from SCA "useradd -D" check -->
+  <rule id="190030" level="0">
+    <if_sid>100006</if_sid>
+    <match>useradd -D|INACTIVE=|wm_sca|sca\[</match>
+    <description>Suppressed: Rule 100006 false positive from SCA useradd -D check</description>
+  </rule>
+
+  <!-- Suppress rule 100007 false positive from SCA -->
+  <rule id="190031" level="0">
+    <if_sid>100007</if_sid>
+    <match>wm_sca|sca\[|Considering rule|Running command</match>
+    <description>Suppressed: Rule 100007 false positive from SCA scan</description>
+  </rule>
+
+  <!-- Suppress 100001 false positive from Wazuh internal ossec.log -->
+  <rule id="190103" level="0">
+    <if_sid>100001</if_sid>
+    <field name="agent.id" type="pcre2">^000$</field>
+    <description>Suppressed: 100001 false positive from Wazuh manager internal restart noise</description>
+  </rule>
+
+  <!-- Suppress Docker container scope start/stop noise -->
+  <rule id="190102" level="0">
+    <if_sid>100011,100016</if_sid>
+    <match>docker-.*\.scope|libcontainer container</match>
+    <description>Suppressed: Docker container scope noise</description>
+  </rule>
+
+  <!-- Suppress systemd targets and user session noise from logout/login -->
+  <rule id="190101" level="0">
+    <if_sid>100011</if_sid>
+    <match>^target |User Manager for UID|User Runtime Directory|Main User Target|Basic System|Paths|Timers|Sockets|Slices|Local File Systems|Network is Online|Remote File Systems</match>
+    <description>Suppressed: Systemd target/session teardown noise</description>
+  </rule>
+
+  <!-- Suppressed low-value service stops — scoped to genuinely noisy,
+       non-security-relevant services only. Security/monitoring tooling
+       (wazuh-*, ssh, rsyslog, filebeat, systemd-journald, snmpd, auditd,
+       falcon-sensor, clamd) was moved OUT of this list and into rule
+       100017/100018 above, which always alert on those regardless of
+       this suppression group, at higher severity.
+
+       FIXED 2026-07-06: ssh|rsyslog|filebeat were still listed here
+       despite being explicitly confirmed as always-critical services.
+       Even though 100017 fired correctly for them (rules 100011 and
+       100017 evaluate independently, so 190100 suppressing the generic
+       100011 copy never blocked 100017), leaving them here was
+       misleading dead weight and a future maintenance trap — if
+       100017/100018 are ever removed or edited without checking this
+       list, these three would silently go back to fully suppressed.
+       Removed for clarity and defense-in-depth.
+       Do not re-add security-tooling service names here. -->
+  <rule id="190100" level="0">
+    <if_sid>100011</if_sid>
+    <match>snapd|systemd-timesyncd|unattended|ModemManager|udisks|accounts-daemon|atd|cron|dbus|irqbalance|multipathd|networkd|polkit|postfix|upower|getty</match>
+    <description>Suppressed: Normal service stop — not security relevant</description>
+  </rule>
+
+  <rule id="190107" level="0">
+    <if_group>syscheck</if_group>
+    <field name="file" type="pcre2">\.(log|json|tmp|bak|swp|cache|lock|pid|db|sqlite|csv|out|gz|zip|tar)$</field>
+    <description>Suppressed: global noisy extension filter (auto-managed by add_fim_dir.sh)</description>
+  </rule>
+
+
+
+
+
+</group>
+
+
+<!-- ════════════════════════════════════════════════════════════════
+     SECTION 17: NOISE SUPPRESSION FOR STOCK RULES
+     ════════════════════════════════════════════════════════════════ -->
+<group name="local,noise_suppression,">
+
+  <!-- Suppress rule 597 flood from routine Windows service registry
+       cleanup during scheduled FIM scans (e.g. cbdhsvc_*, webthreat-
+       defusersvc_*) — these are OS-internal service teardown, not
+       attacker activity. Genuine realtime 597 events not matching
+       this pattern still alert normally. -->
+  <rule id="190105" level="0">
+    <if_sid>597</if_sid>
+    <match type="pcre2">Services\\[A-Za-z]+_[0-9a-f]{5,8}</match>
+    <description>Suppressed: routine per-session Windows service registry cleanup</description>
+  </rule>
+
+</group>
+
+<!-- Suppress dpkg transitional states — half-configured is an
+     intermediate step during every install/upgrade, not a
+     standalone event worth alerting on. 2902 (installed) and
+     2903 (removed) still alert normally. -->
+<group name="local,noise_suppression,">
+  <rule id="190106" level="0">
+    <if_sid>2904</if_sid>
+    <description>Suppressed: dpkg transitional state (half-configured)</description>
+  </rule>
+</group>

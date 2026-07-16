@@ -1,0 +1,608 @@
+#!/var/ossec/framework/python/bin/python3
+"""
+custom-agent-status — Unified Wazuh Agent Status → Telegram
+═══════════════════════════════════════════════════════════════
+Three modes in one script:
+
+  Mode 1 — Integration Hook (Wazuh calls this on rule fire)
+    Usage: custom-agent-status <alert_file.json>
+
+  Mode 2 — Watcher Subprocess (spawned by Mode 1 on disconnect)
+    Usage: custom-agent-status --watcher <agent_id> <hostname>
+
+  Mode 3 — API Poller Daemon (runs as systemd service)
+    Usage: custom-agent-status --poller
+
+All three modes share the same state file, lock, and dispatch
+function — no coordination bugs between hook and poller.
+
+State machine per agent:
+  ACTIVE ──disconnect──► [SLEEP_WINDOW wait]
+     │                         │ reconnects → ACTIVE (sleep suppressed)
+     │                         │ no reconnect → UNREACHABLE
+     │ clean shutdown           │ reconnects → ACTIVE
+     ▼                         │ still gone → INACTIVE
+  INACTIVE ◄────────────────────
+"""
+
+import sys, os, json, time, fcntl, logging, subprocess
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────
+
+# Telegram
+TG_TOKEN  = "8574377540:AAGRLf6PowoBKPADweQbDHv5s229EMHekBI"
+TG_CHAT   = "-1003829063574"
+TG_THREAD = 1454
+ICT       = timezone(timedelta(hours=7))
+
+# Wazuh API (for poller mode)
+API_URL   = "https://127.0.0.1:55000"
+API_USER  = "wazuh"
+API_PASS  = "NewAdminPass2026."
+
+# Timers (seconds)
+POLL_INTERVAL      = 60    # API poller check interval
+SLEEP_WINDOW       = 120   # silent wait after disconnect (absorbs sleep/resume)
+VERDICT_TIMEOUT    = 60    # wait after SLEEP_WINDOW before sending UNREACHABLE
+ESCALATION_TIMEOUT = 300   # from disconnect → escalate to INACTIVE
+
+# Wazuh rule IDs
+RULES_CONNECTED    = {502, 503, 100500, 100501}
+RULES_DISCONNECTED = {501, 504}
+RULES_SHUTDOWN     = {506, 100031}
+
+# Paths
+BASE_DIR       = Path("/var/ossec/integrations")
+STATE_FILE     = BASE_DIR / ".agent-state.json"   # last sent status per agent
+PEND_FILE      = BASE_DIR / ".agent-pending.json"  # active watchers signal channel
+LOCK_FILE      = BASE_DIR / ".agent-lock"          # shared file mutex
+DISC_TIMES_FILE = BASE_DIR / ".agent-disconnect-times.json"  # poller disconnect timers (persisted)
+LOG_FILE       = Path("/var/ossec/logs/custom-agent-status.log")
+
+WATCHER_FLAG = "--watcher"
+POLLER_FLAG  = "--poller"
+
+# ─────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────
+
+def _make_logger(prefix=""):
+    logger = logging.getLogger(f"agent-status{prefix}")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(f"%(asctime)s [{prefix or 'INFO'}] %(message)s"
+                            if prefix else "%(asctime)s [%(levelname)s] %(message)s")
+    fh = logging.FileHandler(LOG_FILE)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    if WATCHER_FLAG not in sys.argv and POLLER_FLAG not in sys.argv:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    return logger
+
+log = _make_logger()
+
+# ─────────────────────────────────────────────────────────────────
+# FILE LOCK
+# ─────────────────────────────────────────────────────────────────
+
+class FileLock:
+    def __init__(self, path):
+        self._path = path
+        self._fh   = None
+    def __enter__(self):
+        self._fh = open(self._path, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+    def __exit__(self, *_):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+# ─────────────────────────────────────────────────────────────────
+# JSON STATE HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def load(path: Path) -> dict:
+    try:
+        if path.exists():
+            t = path.read_text().strip()
+            if t:
+                return json.loads(t)
+    except Exception as e:
+        log.warning(f"load {path.name}: {e}")
+    return {}
+
+def save(path: Path, data: dict):
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(path)
+    except Exception as e:
+        log.warning(f"save {path.name}: {e}")
+
+# ─────────────────────────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────────────────────────
+
+STATUS_MAP = {
+    "active":      "Active ✅",
+    "inactive":    "Inactive 🛑",
+    "unreachable": "Host Unreachable ⚠️",
+}
+
+def format_alert(agent_id: str, hostname: str, status: str) -> str:
+    now = datetime.now(ICT).strftime("%b %d, %Y(ICT) | %I:%M:%S %p")
+    return (
+        f"<b>AGENT STATUS</b>\n===========================\n\n"
+        f"#️⃣ : <code>{agent_id}</code>\n\n"
+        f"🖥️ : <code>{hostname}</code>\n\n"
+        f"⚡ : <code>{STATUS_MAP.get(status, status)}</code>\n\n"
+        f"📅 : <code>{now}</code>\n\n==========================="
+    )
+
+def send_telegram(text: str) -> bool:
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json={
+                "chat_id": TG_CHAT, "message_thread_id": TG_THREAD,
+                "text": text, "parse_mode": "HTML"
+            }, timeout=10)
+            if r.status_code == 429:
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                log.warning(f"Telegram rate-limit — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            log.info("Telegram OK.")
+            return True
+        except Exception as e:
+            log.error(f"Telegram attempt {attempt+1}: {e}")
+            time.sleep(2 ** attempt)
+    return False
+
+# ─────────────────────────────────────────────────────────────────
+# DISPATCH — central anti-duplicate guard
+# ─────────────────────────────────────────────────────────────────
+
+def dispatch(agent_id: str, hostname: str, new_status: str, force=False) -> bool:
+    """Send alert only if status changed. Thread/process safe via FileLock."""
+    with FileLock(LOCK_FILE):
+        state = load(STATE_FILE)
+        last  = state.get(agent_id, {}).get("status")
+        if not force and last == new_status:
+            log.info(f"[{agent_id}] suppressed — already '{new_status}'")
+            return False
+        log.info(f"[{agent_id}] {last!r} → '{new_status}'")
+        if send_telegram(format_alert(agent_id, hostname, new_status)):
+            state[agent_id] = {
+                "status":   new_status,
+                "hostname": hostname,
+                "ts":       datetime.now(ICT).isoformat(),
+            }
+            save(STATE_FILE, state)
+            return True
+    return False
+
+# ─────────────────────────────────────────────────────────────────
+# PENDING FILE HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def clear_pending(agent_id: str):
+    with FileLock(LOCK_FILE):
+        pending = load(PEND_FILE)
+        if agent_id in pending:
+            del pending[agent_id]
+            save(PEND_FILE, pending)
+
+# FIX 1: treat shutdown-flagged entries as "not pending"
+def in_pending(agent_id: str) -> bool:
+    entry = load(PEND_FILE).get(agent_id)
+    if entry is None:
+        return False
+    return not entry.get("shutdown", False)
+
+# FIX 2: helper to detect shutdown flag inside watcher loops
+def is_shutdown(agent_id: str) -> bool:
+    entry = load(PEND_FILE).get(agent_id)
+    return entry is not None and entry.get("shutdown", False)
+
+# ─────────────────────────────────────────────────────────────────
+# MODE 2 — WATCHER SUBPROCESS
+# ─────────────────────────────────────────────────────────────────
+
+def run_watcher(agent_id: str, hostname: str):
+    """
+    Timer state machine running as detached subprocess.
+    Uses per-agent OS lock to prevent duplicate watchers.
+    """
+    wlock_path = BASE_DIR / f".agent-wlock-{agent_id}"
+    wlock_fh   = open(wlock_path, "w")
+    try:
+        fcntl.flock(wlock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info(f"[{agent_id}] watcher PID={os.getpid()} exiting — another watcher owns this agent")
+        wlock_fh.close()
+        return
+
+    try:
+        entry           = load(PEND_FILE).get(agent_id, {})
+        disconnect_time = entry.get("disconnect_time", time.time())
+        log.info(f"[{agent_id}] watcher PID={os.getpid()} started — "
+                 f"SLEEP={SLEEP_WINDOW}s VERDICT={VERDICT_TIMEOUT}s ESCALATION={ESCALATION_TIMEOUT}s")
+
+        # Grace period — wait for rule 506 (shutdown) to arrive after rule 504 (disconnect)
+        # Wazuh fires 504 first, then 506 a moment later — this gives the shutdown handler
+        # time to set the flag before we enter the timer loop
+        time.sleep(5)
+        if is_shutdown(agent_id):
+            log.info(f"[{agent_id}] shutdown flag set during grace period — watcher exiting")
+            clear_pending(agent_id)
+            return
+
+        # If agent is already inactive — only wait for reconnect (ACTIVE)
+        state = load(STATE_FILE)
+        if state.get(agent_id, {}).get("status") == "inactive":
+            log.info(f"[{agent_id}] already inactive — waiting for reconnect only")
+            while True:
+                time.sleep(10)
+                if not in_pending(agent_id):
+                    log.info(f"[{agent_id}] reconnected from inactive — sending ACTIVE")
+                    clear_pending(agent_id)
+                    dispatch(agent_id, hostname, "active")
+                    return
+
+        # ── Phase 1: SLEEP_WINDOW — absorb sleep/resume ───────────
+        recovered = False
+        while time.time() < disconnect_time + SLEEP_WINDOW:
+            time.sleep(5)
+            # FIX 2: exit immediately if shutdown was flagged
+            if is_shutdown(agent_id):
+                log.info(f"[{agent_id}] shutdown detected in SLEEP_WINDOW — watcher exiting")
+                clear_pending(agent_id)
+                return
+            if not in_pending(agent_id):
+                recovered = True
+                log.info(f"[{agent_id}] recovery within SLEEP_WINDOW → sleep/resume")
+                break
+        if recovered:
+            state = load(STATE_FILE)
+            shutdown_ts = state.get(agent_id, {}).get("shutdown_ts", 0)
+            if time.time() - shutdown_ts < 10:
+                log.info(f"[{agent_id}] cleared due to shutdown — not sending ACTIVE")
+                return
+            clear_pending(agent_id)
+            dispatch(agent_id, hostname, "active")
+            return
+
+        # ── Phase 2: VERDICT_TIMEOUT — still gone → UNREACHABLE ───
+        while time.time() < disconnect_time + SLEEP_WINDOW + VERDICT_TIMEOUT:
+            time.sleep(5)
+            # FIX 2: exit immediately if shutdown was flagged
+            if is_shutdown(agent_id):
+                log.info(f"[{agent_id}] shutdown detected in VERDICT_TIMEOUT — watcher exiting")
+                clear_pending(agent_id)
+                return
+            if not in_pending(agent_id):
+                recovered = True
+                log.info(f"[{agent_id}] recovery after SLEEP_WINDOW before VERDICT")
+                break
+        if recovered:
+            state = load(STATE_FILE)
+            shutdown_ts = state.get(agent_id, {}).get("shutdown_ts", 0)
+            if time.time() - shutdown_ts < 10:
+                log.info(f"[{agent_id}] cleared due to shutdown — not sending ACTIVE")
+                return
+            clear_pending(agent_id)
+            dispatch(agent_id, hostname, "active")
+            return
+
+        log.info(f"[{agent_id}] VERDICT_TIMEOUT passed — sending UNREACHABLE")
+        dispatch(agent_id, hostname, "unreachable")
+
+        # ── Phase 3: ESCALATION_TIMEOUT — still gone → INACTIVE ───
+        while time.time() < disconnect_time + ESCALATION_TIMEOUT:
+            time.sleep(10)
+            # FIX 2: exit immediately if shutdown was flagged
+            if is_shutdown(agent_id):
+                log.info(f"[{agent_id}] shutdown detected in ESCALATION — watcher exiting")
+                clear_pending(agent_id)
+                return
+            if not in_pending(agent_id):
+                recovered = True
+                log.info(f"[{agent_id}] recovery after UNREACHABLE — sending ACTIVE")
+                break
+
+        clear_pending(agent_id)
+        if recovered:
+            dispatch(agent_id, hostname, "active")
+        else:
+            log.info(f"[{agent_id}] ESCALATION_TIMEOUT passed — escalating to INACTIVE")
+            dispatch(agent_id, hostname, "inactive", force=True)
+
+    finally:
+        fcntl.flock(wlock_fh, fcntl.LOCK_UN)
+        wlock_fh.close()
+        try:
+            wlock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+def spawn_watcher(agent_id: str, hostname: str):
+    subprocess.Popen(
+        ["/var/ossec/framework/python/bin/python3",
+         str(BASE_DIR / "custom-agent-status"),
+         WATCHER_FLAG, agent_id, hostname],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    log.info(f"[{agent_id}] verdict watcher spawned.")
+
+# ─────────────────────────────────────────────────────────────────
+# MODE 3 — API POLLER DAEMON
+# ─────────────────────────────────────────────────────────────────
+
+def api_token() -> str | None:
+    try:
+        r = requests.post(f"{API_URL}/security/user/authenticate",
+                          auth=(API_USER, API_PASS), verify=False, timeout=10)
+        r.raise_for_status()
+        return r.json()["data"]["token"]
+    except Exception as e:
+        log.warning(f"API auth error: {e}")
+        return None
+
+def api_agents(token: str) -> list:
+    try:
+        r = requests.get(f"{API_URL}/agents",
+                         headers={"Authorization": f"Bearer {token}"},
+                         params={"limit": 500, "select": "id,name,status"},
+                         verify=False, timeout=15)
+        r.raise_for_status()
+        return r.json()["data"]["affected_items"]
+    except Exception as e:
+        log.warning(f"API agents error: {e}")
+        return []
+
+def run_poller():
+    """
+    API Poller — detects status changes for agents that don't trigger rules.
+    Coordinates with watcher via PEND_FILE:
+    - Skips agents currently being watched (watcher handles them)
+    - Only sends ACTIVE when status changes and no watcher is running
+    - Handles disconnect timer chain for agents with no rule trigger
+    """
+    singleton = open("/tmp/wazuh-poller.lock", "w")
+    try:
+        fcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info("Another poller instance is running. Exiting.")
+        sys.exit(0)
+
+    poller_log = _make_logger("POLLER")
+
+    disc_times: dict[str, float] = load(DISC_TIMES_FILE)
+    _now0 = time.time()
+    _stale = [aid for aid, t in disc_times.items() if _now0 - t >= ESCALATION_TIMEOUT]
+    for aid in _stale:
+        del disc_times[aid]
+    if disc_times:
+        poller_log.info(f"Restored {len(disc_times)} in-progress disconnect timer(s) from disk")
+    if _stale:
+        poller_log.info(f"Discarded {len(_stale)} stale disconnect timer(s) on startup")
+    poller_log.info(f"API poller started — interval={POLL_INTERVAL}s")
+
+    while True:
+        time.sleep(POLL_INTERVAL)
+        try:
+            token = api_token()
+            if not token:
+                continue
+
+            agents = api_agents(token)
+            now    = time.time()
+
+            # Cleanup: drop state entries for agents no longer returned by the API at all
+            live_ids = {str(a.get("id", "000")).zfill(3) for a in agents}
+            with FileLock(LOCK_FILE):
+                _state = load(STATE_FILE)
+                _orphans = [aid for aid in _state if aid not in live_ids and aid != "000"]
+                for aid in _orphans:
+                    poller_log.info(f"[{aid}] orphaned — no longer returned by API, removing from state")
+                    del _state[aid]
+                    disc_times.pop(aid, None)
+                if _orphans:
+                    save(STATE_FILE, _state)
+
+            for agent in agents:
+                aid    = str(agent.get("id", "000")).zfill(3)
+                name   = agent.get("name", aid)
+                status = agent.get("status", "").lower()
+                if aid == "000":
+                    continue
+
+                state   = load(STATE_FILE)
+                pending = load(PEND_FILE)
+                last    = state.get(aid, {}).get("status")
+
+                # ── ACTIVE ────────────────────────────────────────
+                if status == "active":
+                    if aid in disc_times:
+                        del disc_times[aid]
+                    if aid in pending:
+                        with FileLock(LOCK_FILE):
+                            p = load(PEND_FILE)
+                            if aid in p:
+                                del p[aid]
+                                save(PEND_FILE, p)
+                                poller_log.info(f"[{aid}] POLLER recovery signal sent to watcher")
+                        continue
+                    if last != "active":
+                        poller_log.info(f"[{aid}] API detected active (last={last!r})")
+                        dispatch(aid, name, "active")
+
+                # ── DISCONNECTED ──────────────────────────────────
+                elif status == "disconnected":
+                    if aid in pending:
+                        continue
+
+                    if last == "inactive":
+                        if aid in disc_times:
+                            del disc_times[aid]
+                        continue
+                    shutdown_ts = state.get(aid, {}).get("shutdown_ts", 0)
+                    if time.time() - shutdown_ts < ESCALATION_TIMEOUT:
+                        if aid in disc_times:
+                            del disc_times[aid]
+                        continue
+
+                    if aid not in disc_times:
+                        disc_times[aid] = now
+                        poller_log.info(f"[{aid}] API detected disconnect — starting timer")
+
+                    elapsed = now - disc_times[aid]
+
+                    if elapsed < SLEEP_WINDOW:
+                        continue
+
+                    if elapsed < SLEEP_WINDOW + VERDICT_TIMEOUT:
+                        continue
+
+                    if last == "inactive":
+                        if aid in disc_times:
+                            del disc_times[aid]
+                        continue
+                    if last != "unreachable":
+                        poller_log.info(f"[{aid}] API: VERDICT passed → UNREACHABLE")
+                        dispatch(aid, name, "unreachable")
+                    if elapsed >= ESCALATION_TIMEOUT:
+                        if last != "inactive":
+                            poller_log.info(f"[{aid}] API: ESCALATION passed → INACTIVE")
+                            dispatch(aid, name, "inactive", force=True)
+                            del disc_times[aid]
+
+            save(DISC_TIMES_FILE, disc_times)
+
+        except Exception as e:
+            poller_log.error(f"Poll loop error: {e}")
+
+# ─────────────────────────────────────────────────────────────────
+# MODE 1 — INTEGRATION HOOK (called by Wazuh)
+# ─────────────────────────────────────────────────────────────────
+
+def classify(rule_id: int, full_log: str) -> str | None:
+    if rule_id in RULES_CONNECTED:    return "connected"
+    if rule_id in RULES_SHUTDOWN:     return "shutdown"
+    if rule_id in RULES_DISCONNECTED: return "disconnected"
+    fl = full_log.lower()
+    if any(k in fl for k in ("agent started", "agent connected")):   return "connected"
+    if any(k in fl for k in ("agent stopped", "clean shutdown")):    return "shutdown"
+    if any(k in fl for k in ("agent disconnected", "keepalive")):    return "disconnected"
+    return None
+
+def handle(alert: dict):
+    rule_id  = int(alert.get("rule", {}).get("id", 0))
+    agent_id = str(alert.get("agent", {}).get("id", "000")).zfill(3)
+    hostname = alert.get("agent", {}).get("name", "unknown")
+    full_log = alert.get("full_log", "")
+
+    log.info(f"Rule {rule_id} | agent={agent_id} | host={hostname} | log={full_log[:80]}")
+
+    if agent_id == "000":
+        return
+
+    event = classify(rule_id, full_log)
+    log.info(f"[{agent_id}] classified as: {event!r}")
+
+    if event is None:
+        log.info(f"[{agent_id}] no matching pattern — skipped.")
+        return
+
+    # ── CONNECTED ─────────────────────────────────────────────────
+    if event == "connected":
+        with FileLock(LOCK_FILE):
+            pending = load(PEND_FILE)
+            if agent_id in pending:
+                del pending[agent_id]
+                save(PEND_FILE, pending)
+                log.info(f"[{agent_id}] recovery signal sent to watcher.")
+                return
+        dispatch(agent_id, hostname, "active")
+        return
+
+    # ── CLEAN SHUTDOWN ────────────────────────────────────────────
+    # FIX 3: set shutdown flag first so watcher exits, then dispatch INACTIVE
+    if event == "shutdown":
+        log.info(f"[{agent_id}] clean shutdown — cancelling watcher, sending INACTIVE.")
+        with FileLock(LOCK_FILE):
+            pending = load(PEND_FILE)
+            if agent_id in pending:
+                pending[agent_id]["shutdown"] = True   # watcher sees this and exits
+                save(PEND_FILE, pending)
+            # Write shutdown_ts so poller skips this agent
+            state = load(STATE_FILE)
+            state.setdefault(agent_id, {})["shutdown_ts"] = time.time()
+            save(STATE_FILE, state)
+        time.sleep(0.3)   # give watcher one loop tick to see the flag
+        with FileLock(LOCK_FILE):
+            pending = load(PEND_FILE)
+            if agent_id in pending:
+                del pending[agent_id]
+                save(PEND_FILE, pending)
+        dispatch(agent_id, hostname, "inactive")
+        return
+
+    # ── DISCONNECTED ──────────────────────────────────────────────
+    if event == "disconnected":
+        should_spawn = False
+        with FileLock(LOCK_FILE):
+            pending = load(PEND_FILE)
+            if agent_id in pending:
+                log.info(f"[{agent_id}] watcher already running — ignoring duplicate disconnect.")
+                return
+            pending[agent_id] = {
+                "hostname":        hostname,
+                "disconnect_time": time.time(),
+            }
+            save(PEND_FILE, pending)
+            should_spawn = True
+        if should_spawn:
+            spawn_watcher(agent_id, hostname)
+        return
+
+# ─────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Mode 2 — Watcher subprocess
+    if len(sys.argv) == 4 and sys.argv[1] == WATCHER_FLAG:
+        run_watcher(sys.argv[2], sys.argv[3])
+        sys.exit(0)
+
+    # Mode 3 — API Poller daemon
+    if len(sys.argv) == 2 and sys.argv[1] == POLLER_FLAG:
+        run_poller()
+        sys.exit(0)
+
+    # Mode 1 — Integration hook
+    if len(sys.argv) < 2:
+        log.error("Usage: custom-agent-status <alert_file>")
+        sys.exit(1)
+    try:
+        alert = json.loads(Path(sys.argv[1]).read_text())
+    except Exception as e:
+        log.error(f"Cannot read alert file: {e}")
+        sys.exit(1)
+    handle(alert)

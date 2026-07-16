@@ -1,0 +1,6 @@
+#!/var/ossec/framework/python/bin/python3
+import sys
+sys.path.insert(0, "/var/ossec/integrations")
+from security_events.main import run
+if __name__ == "__main__":
+    run(sys.argv)
