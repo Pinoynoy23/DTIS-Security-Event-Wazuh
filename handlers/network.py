@@ -1,4 +1,3 @@
-# /var/ossec/integrations/security_events/handlers/network.py
 from __future__ import annotations
 
 from security_events.utils.formatter import header, divider, esc
