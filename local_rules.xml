@@ -1,5 +1,4 @@
-<!--
-  ════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
   LOCAL RULES — DevAP-Wazuh-Local
   ════════════════════════════════════════════════════════════════
 
@@ -394,13 +393,13 @@
 <group name="local,syslog,malware,">
 
   <rule id="100009" level="12">
-    <if_group>syslog</if_group>
-    <match>powershell|cmd.exe</match>
-    <regex>-enc|-EncodedCommand|IEX|Invoke-Expression|DownloadString|WebClient|Start-Process.*http|bitsadmin|certutil.*urlcache</regex>
-    <description>Suspicious script execution / malware behavior on $(agent.name)</description>
-    <group>malware,execution,</group>
-    <mitre><id>T1059</id></mitre>
-  </rule>
+  <if_group>windows</if_group>
+  <field name="win.system.channel">Microsoft-Windows-PowerShell/Operational</field>
+  <regex>-enc|-EncodedCommand|IEX|Invoke-Expression|DownloadString|WebClient|Start-Process.*http|bitsadmin|certutil.*urlcache</regex>
+  <description>Suspicious script execution / malware behavior on $(agent.name)</description>
+  <group>malware,execution,</group>
+  <mitre><id>T1059</id></mitre>
+</rule>
 
 </group>
 
@@ -535,6 +534,7 @@
     <description>Port scanning detected from $(srcip) on $(agent.name)</description>
     <group>network_scan,recon,</group>
     <mitre><id>T1046</id></mitre>
+    <ignore>120</ignore>
   </rule>
 
 </group>
@@ -569,12 +569,20 @@
        payloads and 5 false-positive strings before this element was
        mistakenly added. -->
   <rule id="100013" level="10">
-    <if_group>web</if_group>
-    <regex type="pcre2">union\s+select|select\s+([\*]|[\w]+(\s*,\s*[\w]+)+|[\w]+)\s+from\s+[\w.`\"\[\]]+\s*(where|;|--|#|$)|insert\s+into\s+\w|drop\s+table\s+\w|exec(\s+|\()xp_|'\s*(--|#)|\.\.\/\.\.\/|%2e%2e%2f|&lt;script[\s&gt;]|javascript:|onerror\s*=|onload\s*=|;\s*(ls|cat|whoami|id)(\s|$|;)</regex>
-    <description>Web attack on $(agent.name) from $(srcip) — SQLi/XSS/Traversal/CMDi</description>
-    <group>web_attack,pci_dss_6.5,</group>
-    <mitre><id>T1190</id></mitre>
-  </rule>
+  <if_group>web</if_group>
+  <url>union%20|union+|select%20|select+|insert%20into%20|insert+into+|drop%20table|drop+table|%20from%20|+from+|xp_cmdshell|%2e%2e%2f|%2e%2e\/</url>
+  <description>Web attack on $(agent.name) from $(srcip) — SQLi/Traversal (URL-encoded)</description>
+  <group>web_attack,pci_dss_6.5,</group>
+  <mitre><id>T1190</id></mitre>
+</rule>
+
+<rule id="100026" level="10">
+  <if_group>web</if_group>
+  <regex type="pcre2">&lt;script[\s&gt;]|javascript:|onerror\s*=|onload\s*=|;\s*(ls|cat|whoami|id)(\s|$|;)</regex>
+  <description>Web attack on $(agent.name) from $(srcip) — XSS/CMDi</description>
+  <group>web_attack,pci_dss_6.5,</group>
+  <mitre><id>T1190</id></mitre>
+</rule>
 
 </group>
 
@@ -586,12 +594,23 @@
 
   <rule id="100014" level="15">
     <if_group>syscheck</if_group>
-    <regex>vssadmin.*delete|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no|\.locked$|\.encrypted$|\.ransom$|\.crypt$|HELP_DECRYPT|READ_ME_ENCRYPTED</regex>
-    <description>RANSOMWARE INDICATORS on $(agent.name) — immediate response required</description>
+    <field name="file" type="pcre2">\.locked$|\.encrypted$|\.ransom$|\.crypt$|HELP_DECRYPT|READ_ME_ENCRYPTED</field>
+    <description>RANSOMWARE INDICATORS on $(agent.name) — file marker detected: $(file)</description>
     <group>ransomware,critical,</group>
     <mitre><id>T1486</id></mitre>
   </rule>
-
+  <!-- Ransomware indicator: shadow-copy/recovery deletion commands -->
+<!-- FIXED: these are command executions, not file-integrity events —
+     if_group syscheck could never match them. Moved to syslog group,
+     same as rule 100009's command-detection pattern. -->
+  <rule id="100025" level="15">
+    <if_group>windows</if_group>
+    <field name="win.system.channel">Microsoft-Windows-PowerShell/Operational</field>
+    <regex type="pcre2">vssadmin.*delete|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no</regex>
+    <description>RANSOMWARE INDICATORS on $(agent.name) — shadow copy/recovery deletion command detected</description>
+    <group>ransomware,critical,</group>
+    <mitre><id>T1490</id><id>T1486</id></mitre>
+  </rule>
 </group>
 
 
@@ -623,6 +642,7 @@
     <description>CORRELATION: Port scan then SSH brute force from $(srcip) — active attack on $(agent.name)</description>
     <group>correlation,active_attack,</group>
     <mitre><id>T1046</id><id>T1110</id></mitre>
+    <ignore>600</ignore>
   </rule>
 
   <!-- Now anchored to 100017 (the always-alert security-tooling stop rule)
@@ -799,6 +819,15 @@
     <mitre><id>T1200</id></mitre>
   </rule>
 
+  !-- ============================================================ -->
+    <!-- TEMPORARY TEST — remove after verifying generic.py fallback  -->
+    <!-- ============================================================ -->
+    <rule id="100999" level="10">
+      <match>DTIS_GENERIC_TEST</match>
+      <description>DTIS TEST: generic.py fallback verification</description>
+      <group>local,</group>
+    </rule>
+
 </group>
 
 <group name="usb,hardware,">
@@ -954,6 +983,15 @@
 
 
 
+
+
+
+
+  <rule id="190108" level="0">
+    <if_group>syscheck</if_group>
+    <field name="file" type="pcre2">^/var/ossec/integrations/(?!.*\.(py)$).*$</field>
+    <description>Suppressed: non-matching extension change in /var/ossec/integrations</description>
+  </rule>
 
 </group>
 

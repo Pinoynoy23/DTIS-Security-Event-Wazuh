@@ -8,6 +8,7 @@ from security_events.utils.dedup import is_duplicate
 
 def handle(alert: dict) -> str | None:
     rule    = alert.get("rule",  {})
+    data    = alert.get("data",  {})
     agent   = alert.get("agent", {}).get("id", "000")
     rule_id = rule.get("id", "?")
     desc    = rule.get("description", "Security event")
@@ -33,11 +34,15 @@ def handle(alert: dict) -> str | None:
         return None
 
     groups = ", ".join(rule.get("groups", []))
+    package = data.get("package", "")
+    version = data.get("version", "")
+    package_line = f"Package: {esc(package)} ({esc(version)})\n" if package else ""
 
     msg = (
         f"{header('SECURITY EVENT', '⚠️', alert)}\n"
         f"📝 INCIDENT ANALYSIS\n"
         f"📋 {esc(desc)}\n"
+        f"{package_line}"
         f"🏷️ Groups: <code>{esc(groups) if groups else 'N/A'}</code>\n"
         f"{divider()}\n"
         f"🛡️ RECOMMENDED REMEDIATION\n"
