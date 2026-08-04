@@ -9,6 +9,43 @@ from security_events.utils.dedup import is_duplicate
 _SYSTEMCTL_TIMEOUT = 5
 _unit_cache = {}
 
+# Services to suppress completely (no alerts)
+SUPPRESSED_SERVICES = [
+    "clamav",
+    "ClamAV",
+    "clamav-daemon",
+    "Clam AntiVirus",
+    "freshclam",
+    "snapd",
+    "systemd-timesyncd",
+    "ModemManager",
+    "udisks",
+    "accounts-daemon",
+    "atd",
+    "cron",
+    "dbus",
+    "irqbalance",
+    "multipathd",
+    "networkd",
+    "polkit",
+    "postfix",
+    "upower",
+    "getty",
+]
+
+
+def _is_suppressed_service(service_desc: str, unit_name: str) -> bool:
+    """Check if this service should be suppressed."""
+    if not service_desc and not unit_name:
+        return False
+    
+    combined = f"{service_desc} {unit_name}".lower()
+    
+    for suppressed in SUPPRESSED_SERVICES:
+        if suppressed.lower() in combined:
+            return True
+    return False
+
 
 def handle(alert: dict) -> str | None:
     data = alert.get("data", {})
@@ -18,7 +55,11 @@ def handle(alert: dict) -> str | None:
     rule_id = alert.get("rule", {}).get("id", "")
 
     action, service_desc, unit_name = _extract_action_and_service(full_log)
-    
+
+    # Check if this service should be suppressed FIRST
+    if _is_suppressed_service(service_desc, unit_name):
+        return None
+
     # If we got a unit name directly from the log, use it
     if unit_name and unit_name != "Unknown":
         unit_path = _get_unit_path(unit_name)
@@ -63,18 +104,11 @@ def _extract_action_and_service(full_log: str) -> tuple[str, str, str]:
     Extract action, service description, and unit name from systemd log.
     Returns: (action, service_description, unit_name)
     """
-    # Debug: log what we're processing
-    # print(f"DEBUG: Processing: {full_log}", file=sys.stderr)
-    
-    # Try to match systemd patterns
-    # Example: "Aug 03 17:00:14 DevAP-Wazuh-Local systemd[1]: Stopped AP Security Operations Center Monitor - Master Controller."
-    # Example: "Aug 03 17:00:14 DevAP-Wazuh-Local systemd[1]: Started AP Security Operations Center Monitor - Master Controller."
-    
     # Extract action first
     action = "unknown"
     service_desc = ""
     unit_name = ""
-    
+
     # Check for action keywords
     if "Stopped " in full_log:
         action = "stopped"
@@ -86,48 +120,40 @@ def _extract_action_and_service(full_log: str) -> tuple[str, str, str]:
         action = "started"
     elif "Restarting " in full_log:
         action = "restarted"
-    
-    # Extract the service description (everything after the action word)
-    # Pattern: systemd[pid]: ACTION Service Description
+
+    # Extract the service description
     patterns = [
         r'(?:Stopped|Started|Stopping|Starting|Restarting)\s+(.+?)(?:\.|$)',
         r'systemd\[\d+\]:\s+(?:Stopped|Started|Stopping|Starting|Restarting)\s+(.+?)(?:\.|$)',
     ]
-    
+
     for pattern in patterns:
         m = re.search(pattern, full_log)
         if m:
             service_desc = m.group(1).strip()
             break
-    
+
     # Try to extract unit name from the description or the log
-    # Many systemd logs include the unit name in the description
-    # Example: "Started wazuh-manager.service - Wazuh manager"
     unit_match = re.search(r'(\S+\.service)', service_desc)
     if unit_match:
         unit_name = unit_match.group(1)
     else:
-        # Try to find it elsewhere in the log
         unit_match = re.search(r'(\S+\.service)[:\s]', full_log)
         if unit_match:
             unit_name = unit_match.group(1)
-    
+
     # If we still don't have a description, try to extract anything after the action
     if not service_desc:
         for prefix in ["Stopped ", "Started ", "Stopping ", "Starting ", "Restarting "]:
             if prefix in full_log:
                 service_desc = full_log.split(prefix, 1)[1].strip()
-                # Remove trailing punctuation
                 service_desc = re.sub(r'[.,;:]$', '', service_desc)
                 break
-    
+
     # If we have a unit name but no description, use the unit name as description
     if unit_name and not service_desc:
         service_desc = unit_name
-    
-    # Debug output
-    # print(f"DEBUG: action={action}, service_desc={service_desc}, unit_name={unit_name}", file=sys.stderr)
-    
+
     return action, service_desc, unit_name
 
 
@@ -135,11 +161,11 @@ def _get_unit_path(unit_name: str) -> str:
     """Get the unit file path for a given unit name."""
     if not unit_name or unit_name == "Unknown":
         return "Unknown"
-    
+
     cached = _unit_cache.get(f"path:{unit_name}")
     if cached is not None:
         return cached
-    
+
     unit_path = "Unknown"
     try:
         frag = subprocess.run(
@@ -151,7 +177,7 @@ def _get_unit_path(unit_name: str) -> str:
             _unit_cache[f"path:{unit_name}"] = unit_path
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
-    
+
     return unit_path
 
 
@@ -170,7 +196,7 @@ def _resolve_unit(service_desc: str) -> tuple[str, str]:
 
     unit_name = "Unknown"
     unit_path = "Unknown"
-    
+
     try:
         # Get list of all services
         listing = subprocess.run(
@@ -178,22 +204,22 @@ def _resolve_unit(service_desc: str) -> tuple[str, str]:
              "--no-legend", "--plain"],
             capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT
         )
-        
+
         # Try to match by description first (most accurate)
         for line in listing.stdout.splitlines():
             parts = line.split(None, 4)
             if len(parts) < 5:
                 continue
             unit, desc = parts[0], parts[4]
-            
+
             # Match if description contains our service description
             # or if our description contains the unit description
-            if (service_desc.lower() in desc.lower() or 
+            if (service_desc.lower() in desc.lower() or
                 desc.lower() in service_desc.lower()):
                 unit_name = unit
                 unit_path = _get_unit_path(unit)
                 break
-        
+
         # If no match found, try to find by unit name pattern
         if unit_name == "Unknown":
             # Try to extract a unit name from the description
@@ -208,9 +234,8 @@ def _resolve_unit(service_desc: str) -> tuple[str, str]:
                 if verify.returncode == 0:
                     unit_name = candidate
                     unit_path = _get_unit_path(unit_name)
-                    
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        # Silent fail - we'll return Unknown
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
 
     result = (unit_name, unit_path)
