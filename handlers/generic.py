@@ -5,30 +5,67 @@ from security_events.config import GENERIC_FORWARD_MIN_LEVEL
 from security_events.utils.formatter import header, divider, esc
 from security_events.utils.dedup import is_duplicate
 
+# Suppressed rules - these will be completely ignored
+SUPPRESSED_RULES = {
+    "52501",  # ClamAV daemon started
+    "52502",  # ClamAV daemon stopped
+    "52503",  # Clamd error
+    "52504",  # ClamAV virus detected
+    "52505",  # ClamAV virus detected (file)
+    "52506",  # ClamAV virus detected (infected)
+    "52507",  # ClamAV database update
+    "52508",  # ClamAV database outdated
+}
+
+# Suppressed patterns - any alert containing these will be ignored
+SUPPRESSED_PATTERNS = [
+    "clamav",
+    "ClamAV",
+    "clamd",
+    "freshclam",
+    "Clam AntiVirus",
+    "virus database",
+]
+
+
+def _is_suppressed(alert: dict) -> bool:
+    """Check if this alert should be suppressed."""
+    rule = alert.get("rule", {})
+    rule_id = rule.get("id", "")
+    full_log = alert.get("full_log", "")
+    description = rule.get("description", "")
+    
+    # Check if rule ID is in suppressed list
+    if rule_id in SUPPRESSED_RULES:
+        return True
+    
+    # Check if any suppressed pattern matches
+    combined = f"{full_log} {description}".lower()
+    for pattern in SUPPRESSED_PATTERNS:
+        if pattern.lower() in combined:
+            return True
+    
+    return False
+
 
 def handle(alert: dict) -> str | None:
-    rule    = alert.get("rule",  {})
-    data    = alert.get("data",  {})
-    agent   = alert.get("agent", {}).get("id", "000")
+    rule = alert.get("rule", {})
+    data = alert.get("data", {})
+    agent = alert.get("agent", {}).get("id", "000")
     rule_id = rule.get("id", "?")
-    desc    = rule.get("description", "Security event")
-    level   = int(rule.get("level", 0))
+    desc = rule.get("description", "Security event")
+    level = int(rule.get("level", 0))
     full_log = alert.get("full_log", "")
 
+    # Check if this alert should be suppressed (ClamAV, etc.)
+    if _is_suppressed(alert):
+        return None
+
     # Only forward if level is high enough to warrant attention.
-    # Threshold lives in config.py (GENERIC_FORWARD_MIN_LEVEL) rather than
-    # hardcoded here, so it's visible alongside MIN_LEVEL and overridable
-    # via env without a code change.
     if level < GENERIC_FORWARD_MIN_LEVEL:
         return None
 
-    # Include a snippet of full_log in the dedup key: without any
-    # event-specific content, the key had no way to distinguish two
-    # genuinely different events that happen to share a rule ID on the
-    # same agent (e.g. rule 592 "Log file size reduced" firing for two
-    # different files back-to-back). This is the catch-all fallback
-    # handler for anything not explicitly mapped elsewhere, so its dedup
-    # precision matters more than any other handler's.
+    # Include a snippet of full_log in the dedup key
     key = f"generic:{agent}:{rule_id}:{full_log[:120]}"
     if is_duplicate(key, "default"):
         return None
@@ -36,7 +73,7 @@ def handle(alert: dict) -> str | None:
     groups = ", ".join(rule.get("groups", []))
     package = data.get("package", "")
     version = data.get("version", "")
-    package_line = f"Package: {esc(package)} ({esc(version)})\n" if package else ""
+    package_line = f"📦 Package: <code>{esc(package)} ({esc(version)})</code>\n" if package else ""
 
     msg = (
         f"{header('SECURITY EVENT', '⚠️', alert)}\n"

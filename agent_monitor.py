@@ -1,25 +1,7 @@
 #!/usr/bin/env python3
-# /var/ossec/integrations/security_events/agent_monitor.py
 """
 Polls global.db every 15s, alerts on Telegram when an agent is
 added or removed from the Wazuh manager.
-
-Lives inside the security_events package (as a sibling to main.py, not
-inside handlers/) because it's a second, independent entry point rather
-than a rule-dispatched handler — it has no handle(alert) function and is
-never imported by main.py's _get_handler(). It's invoked directly:
-
-    python3 -m security_events.agent_monitor
-
-or, from outside the package directory:
-
-    python3 /var/ossec/integrations/security_events/agent_monitor.py
-
-Reuses security_events.utils.telegram.send_message() for delivery instead
-of a separate HTTP/SSL implementation, so this script gets the same TLS
-verification, retry/backoff, and 429 handling as the main alert pipeline
-for free — and any future fix to Telegram delivery only has to happen
-in one place.
 """
 
 import sqlite3
@@ -32,12 +14,9 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 
 if __package__ in (None, ""):
-    # Allows `python3 agent_monitor.py` (direct path invocation) to still
-    # resolve the security_events package for the absolute import below.
-    # Not needed when run as `python3 -m security_events.agent_monitor`.
     sys.path.insert(0, "/var/ossec/integrations")
 
-from security_events.utils.telegram import send_message  # noqa: E402
+from security_events.utils.telegram import send_message
 
 GLOBAL_DB = "/var/ossec/queue/db/global.db"
 SNAPSHOT_FILE = "/var/ossec/integrations/.agent_monitor_snapshot.json"
@@ -76,15 +55,40 @@ def build_message(header_text: str, agent_id: str, agent_name: str, status_label
 
 
 def get_agents() -> dict:
-    # Read-only connection: this script should never be able to write to
-    # Wazuh's live agent database.
-    con = sqlite3.connect(f"file:{GLOBAL_DB}?mode=ro", uri=True, timeout=5)
-    try:
-        cur = con.cursor()
-        cur.execute("SELECT id, name FROM agent WHERE id != '000'")
-        return {str(i): n for i, n in cur.fetchall()}
-    finally:
-        con.close()
+    """Get agents from global.db with retry on lock."""
+    max_retries = 5
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            # Use WAL mode and a longer timeout
+            con = sqlite3.connect(
+                f"file:{GLOBAL_DB}?mode=ro&cache=shared",
+                uri=True,
+                timeout=10.0,
+                isolation_level=None
+            )
+            try:
+                # Enable WAL mode for better concurrency
+                con.execute("PRAGMA journal_mode=WAL")
+                con.execute("PRAGMA busy_timeout=10000")
+                
+                cur = con.cursor()
+                cur.execute("SELECT id, name FROM agent WHERE id != '000'")
+                result = {str(i): n for i, n in cur.fetchall()}
+                if attempt > 0:
+                    logger.info(f"Database connection succeeded after {attempt} retries")
+                return result
+            finally:
+                con.close()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < max_retries - 1:
+                logger.warning(f"Database locked, retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            raise
+    return {}
 
 
 def load_snapshot():
@@ -99,35 +103,40 @@ def load_snapshot():
 
 
 def save_snapshot(agents: dict) -> None:
-    # Atomic write: write to temp file, then rename over the original,
-    # so a crash mid-write can't leave a truncated/corrupt snapshot.
-    with open(SNAPSHOT_TMP, "w") as f:
-        json.dump(agents, f)
-    os.replace(SNAPSHOT_TMP, SNAPSHOT_FILE)
+    try:
+        with open(SNAPSHOT_TMP, "w") as f:
+            json.dump(agents, f, indent=2)
+        os.replace(SNAPSHOT_TMP, SNAPSHOT_FILE)
+        os.chmod(SNAPSHOT_FILE, 0o644)
+    except Exception as e:
+        logger.error(f"Failed to save snapshot: {e}")
 
 
 def main() -> None:
+    logger.info("Agent monitor started")
+    
     snapshot = load_snapshot()
 
     if snapshot is None:
         snapshot = get_agents()
-        save_snapshot(snapshot)
-        logger.info(f"Baseline saved: {len(snapshot)} agents")
+        if snapshot:
+            save_snapshot(snapshot)
+            logger.info(f"Baseline saved: {len(snapshot)} agents")
+        else:
+            logger.error("Failed to get initial agent list")
+            return
 
     while True:
         try:
             current = get_agents()
+            
+            if not current:
+                logger.warning("Could not get current agents, skipping poll")
+                time.sleep(POLL_SECONDS)
+                continue
 
             removed = set(snapshot) - set(current)
             added = set(current) - set(snapshot)
-            # IDs present in both snapshots, but whose name changed —
-            # this indicates the agent ID was reused by a different
-            # machine (or renamed) between polls. Without this check,
-            # an agent identity swap within a single 15s window would go
-            # completely undetected: the ID exists in both `snapshot`
-            # and `current`, so it appears in neither `removed` nor
-            # `added`, even though the actual endpoint behind that ID
-            # has changed.
             renamed = {
                 aid for aid in (set(snapshot) & set(current))
                 if snapshot[aid] != current[aid]
@@ -135,12 +144,16 @@ def main() -> None:
 
             for aid in removed:
                 msg = build_message("🔴 AGENT REMOVED", aid, snapshot[aid], "Removed ❌")
-                if not send_message(msg):
+                if send_message(msg):
+                    logger.info(f"Sent removal alert for agent {aid}")
+                else:
                     logger.error(f"Failed to send removal alert for agent {aid}")
 
             for aid in added:
                 msg = build_message("✅ AGENT REGISTERED", aid, current[aid], "Added ✅")
-                if not send_message(msg):
+                if send_message(msg):
+                    logger.info(f"Sent registration alert for agent {aid}")
+                else:
                     logger.error(f"Failed to send registration alert for agent {aid}")
 
             for aid in renamed:
@@ -149,17 +162,22 @@ def main() -> None:
                     f"{snapshot[aid]} -> {current[aid]}",
                     "Renamed/reassigned ⚠️",
                 )
-                if not send_message(msg):
+                if send_message(msg):
+                    logger.info(f"Sent rename alert for agent {aid}")
+                else:
                     logger.error(f"Failed to send rename alert for agent {aid}")
 
             if removed or added or renamed:
                 snapshot = current
                 save_snapshot(snapshot)
+                logger.info(f"Snapshot updated: {len(snapshot)} agents")
 
-        except sqlite3.Error:
-            logger.exception("Database error while polling agents")
-        except Exception:
-            logger.exception("Unexpected error in poll loop")
+        except sqlite3.OperationalError as e:
+            logger.error(f"Database error: {e}")
+            time.sleep(5)
+        except Exception as e:
+            logger.exception(f"Unexpected error: {e}")
+            time.sleep(5)
 
         time.sleep(POLL_SECONDS)
 
