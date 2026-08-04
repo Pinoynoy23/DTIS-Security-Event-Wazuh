@@ -57,7 +57,8 @@
 
 <group name="noise_suppression,">
 
-  <!-- Suppress 100089 false positives from Proxmox QEMU/SCA logs -->
+
+ <!-- Suppress 100089 false positives from Proxmox QEMU/SCA logs -->
   <rule id="190033" level="0">
     <if_sid>100089</if_sid>
     <match>logger-helper|upsertElement|wm_sca|usbmux</match>
@@ -513,13 +514,13 @@
        attacker restarting something to hide a gap is caught by 100018
        for the services that matter; routine starts of arbitrary
        software are not worth the delivery cost. -->
-  <rule id="100016" level="0">
-    <if_sid>40700,40701,40702,40703,40704</if_sid>
-    <match>Started</match>
-    <regex negate="yes" type="pcre2">wazuh-manager|Wazuh manager|wazuh-agent-monitor|Wazuh Agent Add/Remove Monitor|wazuh-agent|wazuh-api|Wazuh API Agent Status Poller|wazuh-active|wazuh-telegram|wazuh-indexer|wazuh-dashboard|ap-soc-dashboard|AP SOC Monitor Dashboard|ap-soc-monitor|AP Security Operations Center Monitor|ssh\.service|sshd|Secure Shell|rsyslog|System Logging Service|filebeat|Filebeat|systemd-journald|Journal Service|snmpd|Simple Network Management Protocol|auditd|falcon-sensor|clamd</regex>
-    <description>Service started on $(agent.name)</description>
-    <group>service_start,</group>
-  </rule>
+    <rule id="100016" level="7">
+  <if_sid>40700,40701,40702,40703,40704</if_sid>
+  <match>Started</match>
+  <regex negate="yes" type="pcre2">\.scope$|app-gnome-|docker-.*\.scope|wazuh-manager|Wazuh manager|wazuh-agent-monitor|Wazuh Agent Add/Remove Monitor|wazuh-agent|wazuh-api|Wazuh API Agent Status Poller|wazuh-active|wazuh-telegram|wazuh-indexer|wazuh-dashboard|ap-soc-dashboard|AP SOC Monitor Dashboard|ap-soc-monitor|AP Security Operations Center Monitor|ssh\.service|sshd|Secure Shell|rsyslog|System Logging Service|filebeat|Filebeat|systemd-journald|Journal Service|snmpd|Simple Network Management Protocol|auditd|falcon-sensor|clamd</regex>
+  <description>Service started on $(agent.name)</description>
+  <group>service_start,</group>
+</rule>
 
 </group>
 
@@ -529,6 +530,7 @@
      ════════════════════════════════════════════════════════════════ -->
 <group name="local,firewall,network,">
 
+<<<<<<< HEAD
   <rule id="100012" level="9">
     <if_group>firewall</if_group>
     <description>Port scanning detected from $(srcip) on $(agent.name)</description>
@@ -536,9 +538,32 @@
     <mitre><id>T1046</id></mitre>
     <ignore>120</ignore>
   </rule>
+=======
+ <!-- New intermediate rule: fires (quietly, level 3) on every firewall-group
+     event, giving 100012 a real, non-zero-level rule to build frequency
+     correlation from. Rule 4100 (built-in, level 0) does NOT reliably
+     support cross-event frequency tracking for if_matched_sid/if_matched_group
+     — confirmed via wazuh-logtest: firedtimes counted correctly per-event,
+     but 100012's frequency=6/timeframe=30 never triggered despite 6
+     same-source-IP matches well within the window. -->
+ <rule id="100019" level="3">
+  <if_group>firewall</if_group>
+  <regex type="pcre2" negate="yes">SRC=(\S+) DST=\1(?!\S)</regex>
+  <description>Firewall connection event on $(agent.name) from $(srcip)</description>
+  <group>firewall_event,</group>
+</rule>
+
+ <rule id="100012" level="9" frequency="6" timeframe="30">
+  <if_matched_sid>100019</if_matched_sid>
+  <same_source_ip />
+  <description>Port scanning detected from $(srcip) on $(agent.name) — 6+ connection attempts within 30s</description>
+  <group>network_scan,recon,</group>
+  <mitre><id>T1046</id></mitre>
+  <ignore>60</ignore>
+</rule>
+>>>>>>> 0d7f62fca983fe3b924122d2d08333eb3a0fad50
 
 </group>
-
 
 <!-- ════════════════════════════════════════════════════════════════
      SECTION 11: WEB ATTACKS
@@ -636,8 +661,9 @@
     <mitre><id>T1136</id><id>T1098</id></mitre>
   </rule>
 
-  <rule id="100022" level="13" frequency="2" timeframe="300">
+<rule id="100022" level="13" timeframe="300">
     <if_matched_sid>100012</if_matched_sid>
+    <if_sid>100002,100003</if_sid>
     <same_source_ip />
     <description>CORRELATION: Port scan then SSH brute force from $(srcip) — active attack on $(agent.name)</description>
     <group>correlation,active_attack,</group>
@@ -676,7 +702,6 @@
     <group>correlation,ransomware,apt,critical,</group>
     <mitre><id>T1565</id><id>T1059</id><id>T1486</id></mitre>
   </rule>
-
 </group>
 
 
