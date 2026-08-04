@@ -1,26 +1,4 @@
 # /var/ossec/integrations/security_events/handlers/evasion.py
-"""Handler for defense-evasion alerts (systemd service stop/start events).
-
-Optimizations over the original version:
-  1. Unit resolution (systemctl list-units + show) is now CACHED in-memory
-     for the lifetime of the process, and results persist across calls
-     within a batch. Previously every single alert re-ran two subprocess
-     calls even for a service seen seconds earlier -- expensive, and a
-     source of silent slowdown/timeouts under bursty service-event load.
-  2. subprocess calls now fail fast and safely -- a timeout or missing
-     systemctl no longer risks stalling the whole handler; it just
-     degrades unit_name/unit_path to "Unknown" immediately.
-  3. _extract_action_and_service is more tolerant of real-world systemd
-     log punctuation: multiple trailing periods, quotes, "Reloading",
-     "Failed to stop", and units that appear as "<name>.service" without
-     a human-readable Description= at all.
-  4. Dedup key now includes agent_id + action + service_desc as before,
-     but on the "evasion" TTL bucket (see config.py note below) instead
-     of "default" (10s) -- 10s was too short for real repeated
-     stop/restart-loop scenarios (e.g. a flapping service), causing the
-     same service-down condition to re-alert far more often than
-     intended.
-"""
 from __future__ import annotations
 
 import re
@@ -28,37 +6,39 @@ import subprocess
 from security_events.utils.formatter import header, divider, esc
 from security_events.utils.dedup import is_duplicate
 
-# In-memory cache: service_desc -> (unit_name, unit_path). Cleared only
-# when the process restarts. Safe because unit->description mappings on
-# a given host almost never change at runtime.
-_unit_cache: dict[str, tuple[str, str]] = {}
-
-_SYSTEMCTL_TIMEOUT = 2  # seconds; fail fast rather than risk stalling the alert
+_SYSTEMCTL_TIMEOUT = 5
+_unit_cache = {}
 
 
 def handle(alert: dict) -> str | None:
-    data     = alert.get("data",  {})
-    agent    = alert.get("agent", {})
+    data = alert.get("data", {})
+    agent = alert.get("agent", {})
     full_log = alert.get("full_log", "")
     agent_id = agent.get("id", "000")
+    rule_id = alert.get("rule", {}).get("id", "")
 
-    action, service_desc = _extract_action_and_service(full_log)
-    unit_name, unit_path = _resolve_unit(service_desc)
+    action, service_desc, unit_name = _extract_action_and_service(full_log)
+    
+    # If we got a unit name directly from the log, use it
+    if unit_name and unit_name != "Unknown":
+        unit_path = _get_unit_path(unit_name)
+    else:
+        # Try to resolve by description
+        unit_name, unit_path = _resolve_unit(service_desc)
+
     user = data.get("srcuser") or data.get("dstuser") or "system"
 
-    # NOTE: uses the "evasion" TTL category. If security_events/config.py
-    # does not yet define DEDUP_TTL["evasion"], is_duplicate() falls back
-    # to DEDUP_TTL["default"] (10s) automatically -- add an explicit
-    # entry (e.g. 120-300s) in config.py for this to take effect as
-    # intended rather than silently falling back.
     key = f"evasion:{agent_id}:{action}:{service_desc}"
-    if is_duplicate(key, "evasion"):
+    if is_duplicate(key, "default"):
         return None
 
+    # Determine icon and title based on action
     if action == "stopped":
         icon, title = "🛑", "SERVICE STOPPED"
     elif action == "started":
         icon, title = "✅", "SERVICE STARTED"
+    elif action == "restarted":
+        icon, title = "🔄", "SERVICE RESTARTED"
     else:
         icon, title = "❓", "SERVICE EVENT (ACTION UNCLEAR)"
 
@@ -70,6 +50,7 @@ def handle(alert: dict) -> str | None:
         f"📂 Unit Path: <code>{esc(unit_path)}</code>\n"
         f"⚡ Action: <b>{esc(action.upper())}</b>\n"
         f"👤 Triggered by: <code>{esc(user)}</code>\n"
+        f"📋 Rule ID: <code>{rule_id}</code>\n"
         f"{divider()}\n"
         f"🛡️ RECOMMENDED REMEDIATION\n"
         f"Verify this service change was intentional. Investigate if unauthorized."
@@ -77,107 +58,162 @@ def handle(alert: dict) -> str | None:
     return msg
 
 
-def _extract_action_and_service(full_log: str) -> tuple[str, str]:
-    """Pull (action, human-readable service description) from a systemd
-    journal/syslog line. Order matters: check unambiguous past-tense verbs
-    before the in-progress ("-ing") forms, since a line like
-    'Stopping X...' can appear moments before 'Stopped X.' for the same
-    unit and we want the more specific/confirmed one when both are
-    plausible matches on the same text (defensive; in practice only one
-    verb appears per line).
+def _extract_action_and_service(full_log: str) -> tuple[str, str, str]:
     """
-    # Strip surrounding quotes some systemd versions add around unit
-    # descriptions, and collapse trailing punctuation runs (".", "...",
-    # etc.) so "Stopped Foo Bar..." and "Stopped Foo Bar." both yield
-    # a clean "Foo Bar".
-    text = full_log.strip()
-
-    patterns_stopped = [
-        r'Stopped\s+(.+?)[\.\u2026]*$',
-        r'Failed to stop\s+(.+?)[\.\u2026]*$',
-        r'Unit\s+(\S+)\s+entered failed state',
+    Extract action, service description, and unit name from systemd log.
+    Returns: (action, service_description, unit_name)
+    """
+    # Debug: log what we're processing
+    # print(f"DEBUG: Processing: {full_log}", file=sys.stderr)
+    
+    # Try to match systemd patterns
+    # Example: "Aug 03 17:00:14 DevAP-Wazuh-Local systemd[1]: Stopped AP Security Operations Center Monitor - Master Controller."
+    # Example: "Aug 03 17:00:14 DevAP-Wazuh-Local systemd[1]: Started AP Security Operations Center Monitor - Master Controller."
+    
+    # Extract action first
+    action = "unknown"
+    service_desc = ""
+    unit_name = ""
+    
+    # Check for action keywords
+    if "Stopped " in full_log:
+        action = "stopped"
+    elif "Started " in full_log:
+        action = "started"
+    elif "Stopping " in full_log:
+        action = "stopped"
+    elif "Starting " in full_log:
+        action = "started"
+    elif "Restarting " in full_log:
+        action = "restarted"
+    
+    # Extract the service description (everything after the action word)
+    # Pattern: systemd[pid]: ACTION Service Description
+    patterns = [
+        r'(?:Stopped|Started|Stopping|Starting|Restarting)\s+(.+?)(?:\.|$)',
+        r'systemd\[\d+\]:\s+(?:Stopped|Started|Stopping|Starting|Restarting)\s+(.+?)(?:\.|$)',
     ]
-    patterns_started = [
-        r'Started\s+(.+?)[\.\u2026]*$',
-        r'Failed to start\s+(.+?)[\.\u2026]*$',
-    ]
-    patterns_in_progress_stop = [r'Stopping\s+(.+?)[\.\u2026]*$']
-    patterns_in_progress_start = [r'Starting\s+(.+?)[\.\u2026]*$']
-
-    for pat in patterns_stopped:
-        m = re.search(pat, text)
+    
+    for pattern in patterns:
+        m = re.search(pattern, full_log)
         if m:
-            return "stopped", m.group(1).strip().strip('"\'')
+            service_desc = m.group(1).strip()
+            break
+    
+    # Try to extract unit name from the description or the log
+    # Many systemd logs include the unit name in the description
+    # Example: "Started wazuh-manager.service - Wazuh manager"
+    unit_match = re.search(r'(\S+\.service)', service_desc)
+    if unit_match:
+        unit_name = unit_match.group(1)
+    else:
+        # Try to find it elsewhere in the log
+        unit_match = re.search(r'(\S+\.service)[:\s]', full_log)
+        if unit_match:
+            unit_name = unit_match.group(1)
+    
+    # If we still don't have a description, try to extract anything after the action
+    if not service_desc:
+        for prefix in ["Stopped ", "Started ", "Stopping ", "Starting ", "Restarting "]:
+            if prefix in full_log:
+                service_desc = full_log.split(prefix, 1)[1].strip()
+                # Remove trailing punctuation
+                service_desc = re.sub(r'[.,;:]$', '', service_desc)
+                break
+    
+    # If we have a unit name but no description, use the unit name as description
+    if unit_name and not service_desc:
+        service_desc = unit_name
+    
+    # Debug output
+    # print(f"DEBUG: action={action}, service_desc={service_desc}, unit_name={unit_name}", file=sys.stderr)
+    
+    return action, service_desc, unit_name
 
-    for pat in patterns_started:
-        m = re.search(pat, text)
-        if m:
-            return "started", m.group(1).strip().strip('"\'')
 
-    for pat in patterns_in_progress_stop:
-        m = re.search(pat, text)
-        if m:
-            return "stopped", m.group(1).strip().strip('"\'')
-
-    for pat in patterns_in_progress_start:
-        m = re.search(pat, text)
-        if m:
-            return "started", m.group(1).strip().strip('"\'')
-
-    # Last resort: a bare unit name with no clear verb. Don't guess an
-    # action here -- main.py's rule dispatch (Stopping|Stopped vs
-    # Started regex match) is what determined this alert should exist
-    # at all, so if we can't find the verb ourselves, report the unit
-    # name but mark the action honestly as unknown rather than
-    # fabricating "stopped" or "started".
-    m = re.search(r'(\S+\.service)', text)
-    if m:
-        return "unknown", m.group(1)
-
-    return "unknown", ""
+def _get_unit_path(unit_name: str) -> str:
+    """Get the unit file path for a given unit name."""
+    if not unit_name or unit_name == "Unknown":
+        return "Unknown"
+    
+    cached = _unit_cache.get(f"path:{unit_name}")
+    if cached is not None:
+        return cached
+    
+    unit_path = "Unknown"
+    try:
+        frag = subprocess.run(
+            ["systemctl", "show", unit_name, "-p", "FragmentPath", "--value"],
+            capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT
+        )
+        unit_path = frag.stdout.strip() or "Unknown"
+        if unit_path != "Unknown":
+            _unit_cache[f"path:{unit_name}"] = unit_path
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    
+    return unit_path
 
 
 def _resolve_unit(service_desc: str) -> tuple[str, str]:
-    """Find the systemd unit file name + path matching a Description=.
-
-    Cached per service_desc for the life of the process -- avoids
-    re-running two subprocess calls (list-units + show) for every single
-    alert when the same service repeatedly stops/starts in a short
-    window, which was both slow and a source of missed/delayed alerts
-    under bursty conditions.
+    """
+    Resolve unit name and path from service description.
+    Returns: (unit_name, unit_path)
     """
     if not service_desc:
         return "Unknown", "Unknown"
 
-    cached = _unit_cache.get(service_desc)
+    # Check if we already have this cached
+    cached = _unit_cache.get(f"desc:{service_desc}")
     if cached is not None:
         return cached
 
-    result = ("Unknown", "Unknown")
+    unit_name = "Unknown"
+    unit_path = "Unknown"
+    
     try:
+        # Get list of all services
         listing = subprocess.run(
             ["systemctl", "list-units", "--all", "--type=service",
              "--no-legend", "--plain"],
             capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT
         )
+        
+        # Try to match by description first (most accurate)
         for line in listing.stdout.splitlines():
             parts = line.split(None, 4)
             if len(parts) < 5:
                 continue
             unit, desc = parts[0], parts[4]
-            if desc.strip() == service_desc.strip():
-                frag = subprocess.run(
-                    ["systemctl", "show", unit, "-p", "FragmentPath", "--value"],
+            
+            # Match if description contains our service description
+            # or if our description contains the unit description
+            if (service_desc.lower() in desc.lower() or 
+                desc.lower() in service_desc.lower()):
+                unit_name = unit
+                unit_path = _get_unit_path(unit)
+                break
+        
+        # If no match found, try to find by unit name pattern
+        if unit_name == "Unknown":
+            # Try to extract a unit name from the description
+            unit_match = re.search(r'(\S+\.service)', service_desc)
+            if unit_match:
+                candidate = unit_match.group(1)
+                # Verify it exists
+                verify = subprocess.run(
+                    ["systemctl", "status", candidate],
                     capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT
                 )
-                path = frag.stdout.strip() or "Unknown"
-                result = (unit, path)
-                break
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        # systemctl unavailable, hung, or missing entirely -- degrade
-        # gracefully rather than raising, so the alert still sends with
-        # "Unknown" enrichment instead of failing outright.
-        result = ("Unknown", "Unknown")
+                if verify.returncode == 0:
+                    unit_name = candidate
+                    unit_path = _get_unit_path(unit_name)
+                    
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        # Silent fail - we'll return Unknown
+        pass
 
-    _unit_cache[service_desc] = result
+    result = (unit_name, unit_path)
+    if unit_name != "Unknown":
+        _unit_cache[f"desc:{service_desc}"] = result
     return result
