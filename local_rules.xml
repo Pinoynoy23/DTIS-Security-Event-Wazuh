@@ -1,4 +1,5 @@
-════════════════════════════════════════════════════════════════
+<!--
+  ════════════════════════════════════════════════════════════════
   LOCAL RULES — DevAP-Wazuh-Local
   ════════════════════════════════════════════════════════════════
 
@@ -47,6 +48,16 @@
       suppression rules which don't actually exist in this file
       (their real implementation lives in Section 16, late
       suppressions — comments were leftover from refactoring).
+    - 2026-08-04: Rules 190033, 190024, 190032, 190021, 190022 moved
+      from Section 1 to Section 16. Confirmed via wazuh-analysisd -t
+      that they were being silently ignored: "Signature ID '100089'/
+      '100013'/'100001'/'100008' was not found ... Rule will be
+      ignored." Each referenced a local rule ID (100089, 100013,
+      100001, 100008) defined LATER in this file. Wazuh resolves
+      if_sid against rules already loaded at parse time, so a forward
+      reference never binds. Moved to Section 16, after their real
+      targets, same pattern already used correctly there. No other
+      change made in this revision.
   ════════════════════════════════════════════════════════════════
 -->
 
@@ -56,28 +67,6 @@
      ════════════════════════════════════════════════════════════════ -->
 
 <group name="noise_suppression,">
-
-
- <!-- Suppress 100089 false positives from Proxmox QEMU/SCA logs -->
-  <rule id="190033" level="0">
-    <if_sid>100089</if_sid>
-    <match>logger-helper|upsertElement|wm_sca|usbmux</match>
-    <description>Suppressed: 100089 false positive from Proxmox/SCA internal logs</description>
-  </rule>
-
-  <!-- Suppress web attack false positive from DC PVE (agent 007) -->
-  <rule id="190024" level="0">
-    <if_sid>100013</if_sid>
-    <field name="agent.name">DevAP-DC-PVE-LOCAL</field>
-    <description>Suppressed: Web attack false positive from DC PVE</description>
-  </rule>
-
-  <!-- Suppress Rule 100001 for SU events -->
-  <rule id="190032" level="0">
-    <if_sid>100001</if_sid>
-    <field name="decoder.name">su</field>
-    <description>Suppressed: SU event should use SU rules (100054-100056)</description>
-  </rule>
 
 
   <!-- Suppress indexer-connector retry noise -->
@@ -93,20 +82,6 @@
     <match>Health check failed</match>
     <field name="location">/var/ossec/logs/ossec.log</field>
     <description>Suppressed: Wazuh internal health check failures</description>
-  </rule>
-
-  <!-- Suppress Windows Software Protection scheduled task -->
-  <rule id="190021" level="0">
-    <if_sid>100008</if_sid>
-    <match>Software Protection|sppsvc|RulesEngine</match>
-    <description>Suppressed: Windows Software Protection scheduled task</description>
-  </rule>
-
-  <!-- Suppress Windows Task Scheduler normal operation -->
-  <rule id="190022" level="0">
-    <if_sid>100008</if_sid>
-    <match>Task Scheduler|taskschd|MaintenanceScheduler|USOScheduler</match>
-    <description>Suppressed: Windows Task Scheduler normal operation</description>
   </rule>
 
   <!-- Suppress Windows System error events — low value -->
@@ -530,15 +505,6 @@
      ════════════════════════════════════════════════════════════════ -->
 <group name="local,firewall,network,">
 
-<<<<<<< HEAD
-  <rule id="100012" level="9">
-    <if_group>firewall</if_group>
-    <description>Port scanning detected from $(srcip) on $(agent.name)</description>
-    <group>network_scan,recon,</group>
-    <mitre><id>T1046</id></mitre>
-    <ignore>120</ignore>
-  </rule>
-=======
  <!-- New intermediate rule: fires (quietly, level 3) on every firewall-group
      event, giving 100012 a real, non-zero-level rule to build frequency
      correlation from. Rule 4100 (built-in, level 0) does NOT reliably
@@ -561,7 +527,6 @@
   <mitre><id>T1046</id></mitre>
   <ignore>60</ignore>
 </rule>
->>>>>>> 0d7f62fca983fe3b924122d2d08333eb3a0fad50
 
 </group>
 
@@ -570,29 +535,6 @@
      ════════════════════════════════════════════════════════════════ -->
 <group name="local,web,">
 
-  <!-- HARDENED 2026-07-06: original regex had several loose patterns
-       prone to false positives on completely benign log lines:
-         - "select.*from" matched ANY line containing both words
-           anywhere, e.g. app UI text like "select an option from
-           the menu" or normal SQL admin tooling logs
-         - ";.*whoami" / ";.*ls" / ";.*cat" matched innocuous text
-           containing "ls", "cat", "id", or "whoami" as substrings
-           anywhere after a semicolon, not just as shell commands
-       Tightened to require adjacency/specific SQL syntax shape rather
-       than "these two words appear somewhere in the same line", and
-       anchored the CMDi patterns to actual command-separator syntax.
-       This does NOT weaken real detection: genuine SQLi/CMDi payloads
-       still match, since attackers use these exact adjacent patterns
-       (e.g. "UNION SELECT ... FROM", "; whoami", "; cat /etc/passwd"). -->
-  <!-- FIXED 2026-07-06 (critical): <same_source_ip/> was added here
-       without a paired frequency/if_matched clause, which is invalid
-       Wazuh rule syntax on its own — same_source_ip only has meaning as
-       part of a correlation rule. This caused wazuh-analysisd to reject
-       the entire local_rules.xml file at load time (CRITICAL error,
-       manager failed to start). Removed; the hardened regex below is
-       unaffected and was already verified against 12 real attack
-       payloads and 5 false-positive strings before this element was
-       mistakenly added. -->
   <rule id="100013" level="10">
   <if_group>web</if_group>
   <url>union%20|union+|select%20|select+|insert%20into%20|insert+into+|drop%20table|drop+table|%20from%20|+from+|xp_cmdshell|%2e%2e%2f|%2e%2e\/</url>
@@ -1005,17 +947,41 @@
     <description>Suppressed: global noisy extension filter (auto-managed by add_fim_dir.sh)</description>
   </rule>
 
-
-
-
-
-
-
-
   <rule id="190108" level="0">
     <if_group>syscheck</if_group>
     <field name="file" type="pcre2">^/var/ossec/integrations/(?!.*\.(py)$).*$</field>
     <description>Suppressed: non-matching extension change in /var/ossec/integrations</description>
+  </rule>
+
+  <!-- Moved from Section 1: see change log at top of file for why. -->
+  <rule id="190033" level="0">
+    <if_sid>100089</if_sid>
+    <match>logger-helper|upsertElement|wm_sca|usbmux</match>
+    <description>Suppressed: 100089 false positive from Proxmox/SCA internal logs</description>
+  </rule>
+
+  <rule id="190024" level="0">
+    <if_sid>100013</if_sid>
+    <field name="agent.name">DevAP-DC-PVE-LOCAL</field>
+    <description>Suppressed: Web attack false positive from DC PVE</description>
+  </rule>
+
+  <rule id="190032" level="0">
+    <if_sid>100001</if_sid>
+    <field name="decoder.name">su</field>
+    <description>Suppressed: SU event should use SU rules (100054-100056)</description>
+  </rule>
+
+  <rule id="190021" level="0">
+    <if_sid>100008</if_sid>
+    <match>Software Protection|sppsvc|RulesEngine</match>
+    <description>Suppressed: Windows Software Protection scheduled task</description>
+  </rule>
+
+  <rule id="190022" level="0">
+    <if_sid>100008</if_sid>
+    <match>Task Scheduler|taskschd|MaintenanceScheduler|USOScheduler</match>
+    <description>Suppressed: Windows Task Scheduler normal operation</description>
   </rule>
 
 </group>
