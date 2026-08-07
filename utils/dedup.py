@@ -65,10 +65,14 @@ def is_duplicate(key: str, category: str = "default") -> bool:
         except FileExistsError:
             pass
 
-    lock_fd = open(_LOCK_PATH, "w")
+    try:
+        lock_fd = open(_LOCK_PATH, "w")
+    except OSError as e:
+        logger.error(f"[dedup] Could not open lock file {_LOCK_PATH}: {e}")
+        return False  # fail open — never silently swallow a real alert
+
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
         cache = _load_cache()
 
         # Purge entries that have outlived *their own* category's TTL

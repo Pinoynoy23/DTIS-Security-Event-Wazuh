@@ -1,4 +1,4 @@
-# /var/ossec/integrations/security_events/handlers/agent_dis_connect.py
+# /var/ossec/integrations/security_events/handlers/agent_status.py
 from __future__ import annotations
 
 from security_events.utils.formatter import header, divider, esc

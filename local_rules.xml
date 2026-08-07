@@ -68,6 +68,12 @@
 
 <group name="noise_suppression,">
 
+  <!-- Suppress ALL ClamAV services -->
+<rule id="190202" level="0">
+  <if_sid>100011,100016,100017,100018</if_sid>
+  <regex>clamav|ClamAV|Clam AntiVirus</regex>
+  <description>Suppressed: All ClamAV service events</description>
+</rule>
 
   <!-- Suppress indexer-connector retry noise -->
   <rule id="190025" level="0">
@@ -949,7 +955,7 @@
 
   <rule id="190108" level="0">
     <if_group>syscheck</if_group>
-    <field name="file" type="pcre2">^/var/ossec/integrations/(?!.*\.(py)$).*$</field>
+    <field name="file" type="pcre2">^/var/ossec/integrations/(?!.*\.(bash|php|ps1|py|sh)$).*$</field>
     <description>Suppressed: non-matching extension change in /var/ossec/integrations</description>
   </rule>
 

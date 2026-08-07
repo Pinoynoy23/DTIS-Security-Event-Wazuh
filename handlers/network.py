@@ -18,16 +18,16 @@ PORT_SERVICES = {
     1521: "Oracle", 1723: "PPTP", 3306: "MySQL", 3389: "RDP",
     5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8080: "HTTP-alt",
     8443: "HTTPS-alt", 27017: "MongoDB", 9200: "Elasticsearch",
-    
+
     # Development/Web ports
     3000: "Node.js", 5000: "Flask", 5173: "Vite", 4200: "Angular",
     8000: "Dev/HTTP", 8008: "HTTP-alt", 8081: "HTTP-alt", 8082: "HTTP-alt",
     8088: "HTTP-alt", 8090: "HTTP-alt", 9000: "Jetty", 9001: "Weblogic",
     9090: "Web/Admin", 9443: "HTTPS-alt", 9999: "Web/Admin",
-    
+
     # Database ports
     5984: "CouchDB", 28015: "RethinkDB", 9300: "Elasticsearch",
-    
+
     # Malware/C2 common ports
     4444: "C2/Backdoor", 5555: "C2/Backdoor", 6666: "C2/Backdoor",
     7777: "C2/Backdoor", 8888: "C2/Backdoor", 31337: "C2/Backdoor",
@@ -102,7 +102,7 @@ def _extract_proto(log: str) -> str | None:
 def _determine_attack_type(desc: str) -> tuple[str, str]:
     """Determine attack type and emoji."""
     desc_lower = desc.lower()
-    
+
     if "scan" in desc_lower:
         return "🔍", "Port Scan"
     elif "brute" in desc_lower:
@@ -126,25 +126,25 @@ def handle(alert: dict) -> str | None:
     rule_id = rule.get("id", "unknown")
     desc = rule.get("description", "Network anomaly")
     full_log = alert.get("full_log", "")
-    
+
     # Extract network information
     src_ip = data.get("srcip") or data.get("src_ip") or _extract_ip(full_log, "SRC") or "Unknown"
     dst_ip = data.get("dstip") or data.get("dst_ip") or _extract_ip(full_log, "DST") or "Unknown"
     src_port = data.get("srcport") or data.get("src_port") or _extract_port(full_log, "SPT") or "?"
     dst_port = data.get("dstport") or data.get("dst_port") or _extract_port(full_log, "DPT") or "?"
     proto = data.get("protocol") or data.get("proto") or _extract_proto(full_log) or "?"
-    
+
     # Dedup
     dedup_key = f"net:{agent_id}:{rule_id}:{src_ip}:{dst_ip}:{proto}"
     if is_duplicate(dedup_key, "network"):
         return None
-    
+
     # Get service info
     service = _get_service_name(dst_port)
-    
+
     # Determine attack type
     emoji, attack_type = _determine_attack_type(desc)
-    
+
     # Build the message
     msg_parts = [
         f"{header('NETWORK ALERT', emoji, alert)}",
@@ -153,13 +153,13 @@ def handle(alert: dict) -> str | None:
         f"├─ DST: `{esc(dst_ip)}:{esc(dst_port)}`",
         f"├─ Proto: `{esc(proto)}`",
     ]
-    
+
     # Add service info
     if service != "unknown":
         msg_parts.append(f"└─ Service: `{service}` ({dst_port})")
     else:
         msg_parts.append(f"└─ Port: `{dst_port}`")
-    
+
     # Add recommendation
     if "scan" in desc.lower():
         msg_parts.append(f"\n📌 **Action:** Block `{esc(src_ip)}` at firewall")
@@ -169,6 +169,6 @@ def handle(alert: dict) -> str | None:
         msg_parts.append(f"\n📌 **Action:** Enable DDoS protection for `{esc(src_ip)}`")
     else:
         msg_parts.append(f"\n📌 **Action:** Investigate `{esc(src_ip)}` - block if unauthorized")
-    
+
     # Join and return
     return "\n".join(msg_parts)
